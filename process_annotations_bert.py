@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import math
 import multiprocessing as mp
@@ -143,6 +144,63 @@ class ChunkStats:
     skipped: int
 
 
+def normalize_to_text_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        v = value.strip()
+        return [v] if v else []
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                v = item.strip()
+            else:
+                v = str(item).strip()
+            if v:
+                out.append(v)
+        return out
+    v = str(value).strip()
+    return [v] if v else []
+
+
+def augment_profile_from_nemotron_lists(
+    profile_counts: Counter[str],
+    profile_total: int,
+    dataset_name: str,
+    dataset_split: str,
+    dataset_streaming: bool,
+    dataset_max_rows: int,
+) -> tuple[int, int, int]:
+    from datasets import load_dataset  # type: ignore
+
+    tokenizer = load_tokenizer()
+    ds = load_dataset(dataset_name, split=dataset_split, streaming=dataset_streaming)
+    rows = ds if dataset_max_rows <= 0 else itertools.islice(ds, dataset_max_rows)
+
+    rows_count = 0
+    added_tokens = 0
+    target_fields = ("skills_and_expertise_list", "hobbies_and_interests_list")
+
+    for row in rows:
+        rows_count += 1
+        for field in target_fields:
+            for text in normalize_to_text_list(row.get(field)):
+                for m in tokenizer.tokenize(text):
+                    if not is_independent_word(m):
+                        continue
+                    token = normalize_token(m.lemma)
+                    if not token:
+                        continue
+                    profile_counts[token] += 1
+                    profile_total += 1
+                    added_tokens += 1
+
+    return profile_total, rows_count, added_tokens
+
+
 def split_byte_ranges(
     input_path: Path, workers: int, chunks_per_worker: int = 8
 ) -> list[tuple[int, int]]:
@@ -260,6 +318,11 @@ def process(
     workers: Optional[int] = None,
     show_progress: bool = True,
     chunks_per_worker: int = 8,
+    augment_nemotron_lists: bool = True,
+    nemotron_dataset: str = "nvidia/Nemotron-Personas-Japan",
+    nemotron_split: str = "train",
+    nemotron_streaming: bool = True,
+    nemotron_max_rows: int = 0,
 ) -> None:
     profile_counts: Counter[str] = Counter()
     none_counts: Counter[str] = Counter()
@@ -324,6 +387,20 @@ def process(
         pool.close()
         pool.join()
 
+    nemotron_rows = 0
+    nemotron_added_tokens = 0
+    if augment_nemotron_lists:
+        profile_total, nemotron_rows, nemotron_added_tokens = (
+            augment_profile_from_nemotron_lists(
+                profile_counts=profile_counts,
+                profile_total=profile_total,
+                dataset_name=nemotron_dataset,
+                dataset_split=nemotron_split,
+                dataset_streaming=nemotron_streaming,
+                dataset_max_rows=nemotron_max_rows,
+            )
+        )
+
     # 片側条件: PROFILE 側が大きい語のみ採用
     alpha = 0.05
     results = []
@@ -375,6 +452,10 @@ def process(
     print(f"skipped_non_target={skipped}")
     print(f"total_tokens_{profile_label}={profile_total}")
     print(f"total_tokens_{none_label}={none_total}")
+    if augment_nemotron_lists:
+        print(f"nemotron_dataset={nemotron_dataset}")
+        print(f"nemotron_rows={nemotron_rows}")
+        print(f"nemotron_added_tokens_to_{profile_label}={nemotron_added_tokens}")
     print(f"significant_tokens={len(results)}")
     print(f"output={output_path}")
 
@@ -420,6 +501,32 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="ワーカーあたりのチャンク数（大きいほど進捗表示が細かい）",
     )
+    p.add_argument(
+        "--no-augment-nemotron-lists",
+        action="store_true",
+        help="Nemotronのskills/hobbiesリストをPROFILE集計に追加しない",
+    )
+    p.add_argument(
+        "--nemotron-dataset",
+        default="nvidia/Nemotron-Personas-Japan",
+        help="追加集計に使うNemotronデータセット名",
+    )
+    p.add_argument(
+        "--nemotron-split",
+        default="train",
+        help="追加集計に使うNemotron split 名",
+    )
+    p.add_argument(
+        "--nemotron-no-streaming",
+        action="store_true",
+        help="Nemotron読み込みでstreamingを使わない",
+    )
+    p.add_argument(
+        "--nemotron-max-rows",
+        type=int,
+        default=0,
+        help="Nemotron追加集計の最大行数 (0以下で全件)",
+    )
     return p.parse_args()
 
 
@@ -438,6 +545,11 @@ def main() -> None:
         workers=args.workers,
         show_progress=not args.no_progress,
         chunks_per_worker=args.chunks_per_worker,
+        augment_nemotron_lists=not args.no_augment_nemotron_lists,
+        nemotron_dataset=args.nemotron_dataset,
+        nemotron_split=args.nemotron_split,
+        nemotron_streaming=not args.nemotron_no_streaming,
+        nemotron_max_rows=args.nemotron_max_rows,
     )
 
 

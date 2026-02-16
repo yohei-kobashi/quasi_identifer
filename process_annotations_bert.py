@@ -10,6 +10,7 @@ import math
 import multiprocessing as mp
 import os
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,12 @@ def is_independent_word(m: Morpheme) -> bool:
 
     # UniDic では「歳」などが pos1=接尾辞 になるため許可する
     return m.pos1 in {"名詞", "動詞", "形容詞", "副詞", "接尾辞"}
+
+
+def normalize_token(token: str) -> str:
+    # 全角/半角の揺れを吸収し、英字の大文字小文字を統一する
+    normalized = unicodedata.normalize("NFKC", token)
+    return normalized.lower().strip()
 
 
 def g_test_llr(a: int, b: int, c: int, d: int) -> tuple[float, float]:
@@ -222,7 +229,7 @@ def process_chunk(
             for m in tokenizer.tokenize(clause):
                 if not is_independent_word(m):
                     continue
-                token = m.lemma.strip()
+                token = normalize_token(m.lemma)
                 if not token:
                     continue
                 target_counter[token] += 1

@@ -144,6 +144,24 @@ class ChunkStats:
     skipped: int
 
 
+@dataclass
+class NemotronChunkStats:
+    profile_counts: Counter[str]
+    profile_total: int
+    rows: int
+    texts: int
+
+
+_NEMOTRON_WORKER_TOKENIZER: Optional[FugashiTokenizer] = None
+
+
+def _get_nemotron_worker_tokenizer() -> FugashiTokenizer:
+    global _NEMOTRON_WORKER_TOKENIZER
+    if _NEMOTRON_WORKER_TOKENIZER is None:
+        _NEMOTRON_WORKER_TOKENIZER = load_tokenizer()
+    return _NEMOTRON_WORKER_TOKENIZER
+
+
 def normalize_to_text_list(value) -> list[str]:
     if value is None:
         return []
@@ -166,6 +184,52 @@ def normalize_to_text_list(value) -> list[str]:
     return [v] if v else []
 
 
+def iter_nemotron_text_chunks(
+    rows_iter: Iterable[dict],
+    chunk_rows: int,
+    target_fields: tuple[str, str],
+) -> Iterable[tuple[list[str], int]]:
+    buf_texts: list[str] = []
+    buf_rows = 0
+
+    for row in rows_iter:
+        buf_rows += 1
+        for field in target_fields:
+            buf_texts.extend(normalize_to_text_list(row.get(field)))
+
+        if buf_rows >= chunk_rows:
+            yield buf_texts, buf_rows
+            buf_texts = []
+            buf_rows = 0
+
+    if buf_rows > 0:
+        yield buf_texts, buf_rows
+
+
+def _process_nemotron_text_chunk(args: tuple[list[str], int]) -> NemotronChunkStats:
+    texts, rows = args
+    tokenizer = _get_nemotron_worker_tokenizer()
+    profile_counts: Counter[str] = Counter()
+    profile_total = 0
+
+    for text in texts:
+        for m in tokenizer.tokenize(text):
+            if not is_independent_word(m):
+                continue
+            token = normalize_token(m.lemma)
+            if not token:
+                continue
+            profile_counts[token] += 1
+            profile_total += 1
+
+    return NemotronChunkStats(
+        profile_counts=profile_counts,
+        profile_total=profile_total,
+        rows=rows,
+        texts=len(texts),
+    )
+
+
 def augment_profile_from_nemotron_lists(
     profile_counts: Counter[str],
     profile_total: int,
@@ -173,30 +237,84 @@ def augment_profile_from_nemotron_lists(
     dataset_split: str,
     dataset_streaming: bool,
     dataset_max_rows: int,
+    workers: int,
+    show_progress: bool,
+    chunk_rows: int,
 ) -> tuple[int, int, int]:
     from datasets import load_dataset  # type: ignore
 
-    tokenizer = load_tokenizer()
     ds = load_dataset(dataset_name, split=dataset_split, streaming=dataset_streaming)
     rows = ds if dataset_max_rows <= 0 else itertools.islice(ds, dataset_max_rows)
+    target_fields = ("skills_and_expertise_list", "hobbies_and_interests_list")
+    total_rows_hint: Optional[int] = None
+    if dataset_max_rows > 0:
+        total_rows_hint = dataset_max_rows
+    elif not dataset_streaming:
+        try:
+            total_rows_hint = len(ds)
+        except TypeError:
+            total_rows_hint = None
 
     rows_count = 0
     added_tokens = 0
-    target_fields = ("skills_and_expertise_list", "hobbies_and_interests_list")
+    started_at = time.time()
+    done_chunks = 0
+    done_texts = 0
+    chunk_rows = max(1, chunk_rows)
+    workers = max(1, workers)
 
-    for row in rows:
-        rows_count += 1
-        for field in target_fields:
-            for text in normalize_to_text_list(row.get(field)):
-                for m in tokenizer.tokenize(text):
-                    if not is_independent_word(m):
-                        continue
-                    token = normalize_token(m.lemma)
-                    if not token:
-                        continue
-                    profile_counts[token] += 1
-                    profile_total += 1
-                    added_tokens += 1
+    chunk_iter = iter_nemotron_text_chunks(rows, chunk_rows=chunk_rows, target_fields=target_fields)
+
+    if workers == 1:
+        nemotron_stats_iter = (_process_nemotron_text_chunk(chunk) for chunk in chunk_iter)
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=workers) as pool:
+            nemotron_stats_iter = pool.imap_unordered(
+                _process_nemotron_text_chunk,
+                chunk_iter,
+                chunksize=1,
+            )
+            for st in nemotron_stats_iter:
+                profile_counts.update(st.profile_counts)
+                profile_total += st.profile_total
+                added_tokens += st.profile_total
+                rows_count += st.rows
+                done_chunks += 1
+                done_texts += st.texts
+                if show_progress:
+                    elapsed = max(1e-9, time.time() - started_at)
+                    rows_per_sec = rows_count / elapsed
+                    msg = (
+                        f"[progress:nemotron] chunks={done_chunks} rows={rows_count}"
+                        f" texts={done_texts} added_tokens={added_tokens}"
+                        f" speed={rows_per_sec:.2f} rows/s"
+                    )
+                    if total_rows_hint:
+                        pct = min(100.0, rows_count / total_rows_hint * 100.0)
+                        msg += f" ({pct:.1f}%)"
+                    print(msg)
+            return profile_total, rows_count, added_tokens
+
+    for st in nemotron_stats_iter:
+        profile_counts.update(st.profile_counts)
+        profile_total += st.profile_total
+        added_tokens += st.profile_total
+        rows_count += st.rows
+        done_chunks += 1
+        done_texts += st.texts
+        if show_progress:
+            elapsed = max(1e-9, time.time() - started_at)
+            rows_per_sec = rows_count / elapsed
+            msg = (
+                f"[progress:nemotron] chunks={done_chunks} rows={rows_count}"
+                f" texts={done_texts} added_tokens={added_tokens}"
+                f" speed={rows_per_sec:.2f} rows/s"
+            )
+            if total_rows_hint:
+                pct = min(100.0, rows_count / total_rows_hint * 100.0)
+                msg += f" ({pct:.1f}%)"
+            print(msg)
 
     return profile_total, rows_count, added_tokens
 
@@ -323,6 +441,8 @@ def process(
     nemotron_split: str = "train",
     nemotron_streaming: bool = True,
     nemotron_max_rows: int = 0,
+    nemotron_workers: Optional[int] = None,
+    nemotron_chunk_rows: int = 500,
 ) -> None:
     profile_counts: Counter[str] = Counter()
     none_counts: Counter[str] = Counter()
@@ -389,7 +509,11 @@ def process(
 
     nemotron_rows = 0
     nemotron_added_tokens = 0
+    use_nemotron_workers = 0
     if augment_nemotron_lists:
+        if nemotron_workers is None or nemotron_workers <= 0:
+            nemotron_workers = workers
+        use_nemotron_workers = max(1, nemotron_workers)
         profile_total, nemotron_rows, nemotron_added_tokens = (
             augment_profile_from_nemotron_lists(
                 profile_counts=profile_counts,
@@ -398,6 +522,9 @@ def process(
                 dataset_split=nemotron_split,
                 dataset_streaming=nemotron_streaming,
                 dataset_max_rows=nemotron_max_rows,
+                workers=use_nemotron_workers,
+                show_progress=show_progress,
+                chunk_rows=nemotron_chunk_rows,
             )
         )
 
@@ -454,6 +581,7 @@ def process(
     print(f"total_tokens_{none_label}={none_total}")
     if augment_nemotron_lists:
         print(f"nemotron_dataset={nemotron_dataset}")
+        print(f"nemotron_workers={use_nemotron_workers}")
         print(f"nemotron_rows={nemotron_rows}")
         print(f"nemotron_added_tokens_to_{profile_label}={nemotron_added_tokens}")
     print(f"significant_tokens={len(results)}")
@@ -527,6 +655,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Nemotron追加集計の最大行数 (0以下で全件)",
     )
+    p.add_argument(
+        "--nemotron-workers",
+        type=int,
+        default=0,
+        help="Nemotron追加集計の並列プロセス数 (0以下で--workersと同値)",
+    )
+    p.add_argument(
+        "--nemotron-chunk-rows",
+        type=int,
+        default=500,
+        help="Nemotron追加集計の1チャンクあたり行数",
+    )
     return p.parse_args()
 
 
@@ -550,6 +690,8 @@ def main() -> None:
         nemotron_split=args.nemotron_split,
         nemotron_streaming=not args.nemotron_no_streaming,
         nemotron_max_rows=args.nemotron_max_rows,
+        nemotron_workers=args.nemotron_workers,
+        nemotron_chunk_rows=args.nemotron_chunk_rows,
     )
 
 

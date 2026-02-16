@@ -372,14 +372,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-rows", type=int, default=0, help="0で上限なし")
     p.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
-    p.add_argument("--row-batch-size", type=int, default=256, help="ワーカーへ渡す行バッチサイズ")
+    p.add_argument("--row-batch-size", type=int, default=128, help="ワーカーへ渡す行バッチサイズ")
     p.add_argument(
         "--pool-chunksize",
         type=int,
-        default=128,
+        default=64,
         help="imap_unordered の chunksize",
     )
-    p.add_argument("--progress-every", type=int, default=100)
+    p.add_argument("--progress-every", type=int, default=10)
     p.add_argument(
         "--text-output",
         type=Path,

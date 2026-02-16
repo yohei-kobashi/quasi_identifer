@@ -9,6 +9,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +124,8 @@ def odds_ratio(a: int, b: int, c: int, d: int) -> float:
 
 @dataclass
 class ChunkStats:
+    start: int
+    end: int
     profile_counts: Counter[str]
     none_counts: Counter[str]
     profile_total: int
@@ -132,18 +135,22 @@ class ChunkStats:
     skipped: int
 
 
-def split_byte_ranges(input_path: Path, workers: int) -> list[tuple[int, int]]:
+def split_byte_ranges(
+    input_path: Path, workers: int, chunks_per_worker: int = 8
+) -> list[tuple[int, int]]:
     file_size = input_path.stat().st_size
     if file_size == 0:
         return [(0, 0)]
 
-    workers = max(1, min(workers, file_size))
-    chunk_size = file_size // workers
+    workers = max(1, workers)
+    num_chunks = max(1, workers * max(1, chunks_per_worker))
+    num_chunks = min(num_chunks, file_size)
+    chunk_size = max(1, file_size // num_chunks)
     ranges: list[tuple[int, int]] = []
     start = 0
 
-    for i in range(workers):
-        if i == workers - 1:
+    for i in range(num_chunks):
+        if i == num_chunks - 1:
             end = file_size
         else:
             end = start + chunk_size
@@ -224,6 +231,8 @@ def process_chunk(
                     none_total += 1
 
     return ChunkStats(
+        start=start,
+        end=end,
         profile_counts=profile_counts,
         none_counts=none_counts,
         profile_total=profile_total,
@@ -241,6 +250,8 @@ def process(
     none_label: str = "NONE",
     min_count_profile: int = 1,
     workers: Optional[int] = None,
+    show_progress: bool = True,
+    chunks_per_worker: int = 8,
 ) -> None:
     profile_counts: Counter[str] = Counter()
     none_counts: Counter[str] = Counter()
@@ -255,27 +266,32 @@ def process(
         workers = os.cpu_count() or 1
     workers = max(1, workers)
 
-    ranges = split_byte_ranges(input_path, workers)
-    use_workers = len(ranges)
+    ranges = split_byte_ranges(input_path, workers, chunks_per_worker=chunks_per_worker)
+    use_workers = min(workers, len(ranges))
+    total_chunks = len(ranges)
+    file_size = input_path.stat().st_size
 
-    if use_workers == 1:
-        chunk_stats = [
-            process_chunk(
-                str(input_path), ranges[0][0], ranges[0][1], profile_label, none_label
-            )
-        ]
+    started_at = time.time()
+    completed_chunks = 0
+    completed_bytes = 0
+
+    if use_workers == 1 and total_chunks == 1:
+        st = process_chunk(
+            str(input_path), ranges[0][0], ranges[0][1], profile_label, none_label
+        )
+        chunk_stats_iter = [st]
     else:
         ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=use_workers) as pool:
-            chunk_stats = pool.starmap(
-                process_chunk,
-                [
-                    (str(input_path), start, end, profile_label, none_label)
-                    for start, end in ranges
-                ],
-            )
+        pool = ctx.Pool(processes=use_workers)
+        chunk_stats_iter = pool.imap_unordered(
+            _process_chunk_star,
+            [
+                (str(input_path), start, end, profile_label, none_label)
+                for start, end in ranges
+            ],
+        )
 
-    for st in chunk_stats:
+    for st in chunk_stats_iter:
         profile_counts.update(st.profile_counts)
         none_counts.update(st.none_counts)
         profile_total += st.profile_total
@@ -283,6 +299,22 @@ def process(
         lines += st.lines
         malformed += st.malformed
         skipped += st.skipped
+
+        completed_chunks += 1
+        completed_bytes += max(0, st.end - st.start)
+        if show_progress:
+            pct = (completed_bytes / file_size * 100.0) if file_size > 0 else 100.0
+            elapsed = max(1e-9, time.time() - started_at)
+            mbps = (completed_bytes / (1024 * 1024)) / elapsed
+            print(
+                f"[progress] chunks={completed_chunks}/{total_chunks} "
+                f"bytes={completed_bytes}/{file_size} ({pct:.1f}%) "
+                f"speed={mbps:.2f} MB/s"
+            )
+
+    if not (use_workers == 1 and total_chunks == 1):
+        pool.close()
+        pool.join()
 
     # 片側条件: PROFILE 側が大きい語のみ採用
     alpha = 0.05
@@ -369,7 +401,22 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="並列プロセス数 (0以下でCPUコア数を使用)",
     )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="進行状況の表示を無効化",
+    )
+    p.add_argument(
+        "--chunks-per-worker",
+        type=int,
+        default=8,
+        help="ワーカーあたりのチャンク数（大きいほど進捗表示が細かい）",
+    )
     return p.parse_args()
+
+
+def _process_chunk_star(args: tuple[str, int, int, str, str]) -> ChunkStats:
+    return process_chunk(*args)
 
 
 def main() -> None:
@@ -381,6 +428,8 @@ def main() -> None:
         none_label=args.none_label,
         min_count_profile=args.min_count_profile,
         workers=args.workers,
+        show_progress=not args.no_progress,
+        chunks_per_worker=args.chunks_per_worker,
     )
 
 

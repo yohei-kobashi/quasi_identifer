@@ -82,7 +82,8 @@ def is_independent_word(m: Morpheme) -> bool:
     if m.pos2 in excluded_pos2:
         return False
 
-    return m.pos1 in {"名詞", "動詞", "形容詞", "副詞"}
+    # UniDic では「歳」などが pos1=接尾辞 になるため許可する
+    return m.pos1 in {"名詞", "動詞", "形容詞", "副詞", "接尾辞"}
 
 
 def g_test_llr(a: int, b: int, c: int, d: int) -> tuple[float, float]:

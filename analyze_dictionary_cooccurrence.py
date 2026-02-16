@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""辞書形態素のテキスト内共起を Nemotron-Personas-Japan で集計する。"""
+"""辞書形態素のテキスト内共起セットを Nemotron-Personas-Japan で集計する。"""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 import json
 import multiprocessing as mp
 import os
@@ -138,6 +137,13 @@ def _process_row_task(task: dict) -> list[dict]:
     return out
 
 
+def _process_row_batch_task(tasks: list[dict]) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    for task in tasks:
+        out.extend(_process_row_task(task))
+    return out, len(tasks)
+
+
 def _resolve_field_texts(row: dict, requested_fields: list[str]) -> list[dict]:
     out: list[dict] = []
     for field in requested_fields:
@@ -189,6 +195,17 @@ def iter_sampled_row_tasks(
         }
 
 
+def iter_row_task_batches(row_tasks: Iterable[dict], batch_size: int) -> Iterable[list[dict]]:
+    batch: list[dict] = []
+    for task in row_tasks:
+        batch.append(task)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def run(args: argparse.Namespace) -> None:
     dictionary_terms = load_dictionary_terms(
         dictionary_csv=args.dictionary_csv,
@@ -213,8 +230,7 @@ def run(args: argparse.Namespace) -> None:
         "hobbies_and_interests",
     ]
 
-    term_counts: Counter[str] = Counter()
-    pair_counts: Counter[tuple[str, str]] = Counter()
+    term_set_counts: Counter[tuple[str, ...]] = Counter()
     total_texts = 0
     sampled_rows = 0
     started = time.time()
@@ -228,6 +244,10 @@ def run(args: argparse.Namespace) -> None:
         max_rows=args.max_rows,
         requested_fields=requested_fields,
     )
+    row_task_batches = iter_row_task_batches(
+        row_tasks=row_tasks,
+        batch_size=max(1, args.row_batch_size),
+    )
 
     with args.text_output.open("w", encoding="utf-8") as fw:
         ctx = mp.get_context("spawn")
@@ -236,60 +256,50 @@ def run(args: argparse.Namespace) -> None:
             initializer=_init_worker,
             initargs=(sorted(dictionary_terms),),
         ) as pool:
-            for row_result in pool.imap_unordered(_process_row_task, row_tasks, chunksize=1):
-                sampled_rows += 1
+            for row_result, rows_done in pool.imap_unordered(
+                _process_row_batch_task,
+                row_task_batches,
+                chunksize=max(1, args.pool_chunksize),
+            ):
+                sampled_rows += rows_done
                 for rec in row_result:
                     terms = rec["matched_terms"]
                     fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     total_texts += 1
-                    if not terms:
-                        continue
                     unique_sorted = sorted(set(terms))
-                    for t in unique_sorted:
-                        term_counts[t] += 1
-                    for a, b in itertools.combinations(unique_sorted, 2):
-                        pair_counts[(a, b)] += 1
+                    term_set_counts[tuple(unique_sorted)] += 1
 
                 if args.progress_every > 0 and sampled_rows % args.progress_every == 0:
                     elapsed = max(1e-9, time.time() - started)
                     rps = sampled_rows / elapsed
                     print(
                         f"[progress] sampled_rows={sampled_rows} total_texts={total_texts} "
-                        f"pair_types={len(pair_counts)} speed={rps:.2f} rows/s"
+                        f"set_types={len(term_set_counts)} speed={rps:.2f} rows/s"
                     )
 
     with args.term_output.open("w", encoding="utf-8", newline="") as fw:
         writer = csv.writer(fw)
-        writer.writerow(["token", "text_count", "probability"])
-        for token, cnt in sorted(term_counts.items(), key=lambda x: (-x[1], x[0])):
+        writer.writerow(["terms_json", "set_size", "text_count", "probability"])
+        for term_set, cnt in sorted(term_set_counts.items(), key=lambda x: (-x[1], x[0])):
             p = (cnt / total_texts) if total_texts > 0 else 0.0
-            writer.writerow([token, cnt, p])
-
-    with args.pair_output.open("w", encoding="utf-8", newline="") as fw:
-        writer = csv.writer(fw)
-        writer.writerow(["token_a", "token_b", "cooccurrence_count", "probability"])
-        for (a, b), cnt in sorted(pair_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1])):
-            p = (cnt / total_texts) if total_texts > 0 else 0.0
-            writer.writerow([a, b, cnt, p])
+            writer.writerow([json.dumps(list(term_set), ensure_ascii=False), len(term_set), cnt, p])
 
     elapsed = time.time() - started
     print(f"dictionary_terms={len(dictionary_terms)}")
     print(f"workers={workers}")
     print(f"sampled_rows={sampled_rows}")
     print(f"total_texts={total_texts}")
-    print(f"term_types={len(term_counts)}")
-    print(f"pair_types={len(pair_counts)}")
+    print(f"set_types={len(term_set_counts)}")
     print(f"elapsed_sec={elapsed:.2f}")
     print(f"text_output={args.text_output}")
     print(f"term_output={args.term_output}")
-    print(f"pair_output={args.pair_output}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "辞書形態素を閾値で絞り込み、Nemotron各テキスト内の共起語一覧と"
-            "同時共起確率(テキスト単位)を集計する"
+            "辞書形態素を閾値で絞り込み、Nemotron各テキスト内の"
+            "共起語セット出現確率(テキスト単位)を集計する"
         )
     )
     p.add_argument("--dictionary-csv", type=Path, default=Path("profile_significant_morphemes.csv"))
@@ -302,6 +312,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-rows", type=int, default=0, help="0で上限なし")
     p.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
+    p.add_argument("--row-batch-size", type=int, default=128, help="ワーカーへ渡す行バッチサイズ")
+    p.add_argument(
+        "--pool-chunksize",
+        type=int,
+        default=64,
+        help="imap_unordered の chunksize",
+    )
     p.add_argument("--progress-every", type=int, default=100)
     p.add_argument(
         "--text-output",
@@ -311,12 +328,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--term-output",
         type=Path,
-        default=Path("nemotron_term_probabilities.csv"),
-    )
-    p.add_argument(
-        "--pair-output",
-        type=Path,
-        default=Path("nemotron_pair_cooccurrence_probabilities.csv"),
+        default=Path("nemotron_term_set_probabilities.csv"),
     )
     args = p.parse_args()
 

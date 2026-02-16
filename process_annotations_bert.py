@@ -78,7 +78,7 @@ def is_independent_word(m: Morpheme) -> bool:
         return False
 
     # 非自立や形式語的なものを除外
-    excluded_pos2 = {"非自立", "接尾", "代名詞"}
+    excluded_pos2 = {"非自立", "代名詞"}
     if m.pos2 in excluded_pos2:
         return False
 

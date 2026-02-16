@@ -5,5 +5,5 @@
 #PBS -j oe
 
 cd quasi_identifer
-source en/bin/activate
+source env/bin/activate
 python python analyze_dictionary_cooccurrence.py --sample-ratio 1 --min-count-profile 100 --min-odds-ratio 2 --row-batch-size 16 --pool-chunksize 1 --progress-every 10

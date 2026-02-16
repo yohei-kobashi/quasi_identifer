@@ -9,9 +9,9 @@ import json
 import multiprocessing as mp
 import os
 import random
+import sqlite3
 import time
 import unicodedata
-from collections import Counter
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -206,6 +206,59 @@ def iter_row_task_batches(row_tasks: Iterable[dict], batch_size: int) -> Iterabl
         yield batch
 
 
+def setup_sqlite(db_path: Path) -> sqlite3.Connection:
+    if db_path.exists():
+        db_path.unlink()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size=-200000;")
+    conn.execute("CREATE TABLE raw_sets (term_set_key TEXT NOT NULL);")
+    conn.commit()
+    return conn
+
+
+def flush_set_buffer(conn: sqlite3.Connection, buf: list[tuple[str]]) -> None:
+    if not buf:
+        return
+    conn.executemany("INSERT INTO raw_sets (term_set_key) VALUES (?)", buf)
+    conn.commit()
+    buf.clear()
+
+
+def export_set_probabilities(conn: sqlite3.Connection, total_texts: int, output_path: Path) -> int:
+    conn.execute("DROP TABLE IF EXISTS set_counts;")
+    conn.execute(
+        """
+        CREATE TABLE set_counts AS
+        SELECT term_set_key, COUNT(*) AS text_count
+        FROM raw_sets
+        GROUP BY term_set_key
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_set_counts_count ON set_counts(text_count DESC);")
+    conn.commit()
+
+    cur = conn.execute("SELECT COUNT(*) FROM set_counts")
+    set_types = int(cur.fetchone()[0])
+
+    with output_path.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["terms_json", "set_size", "text_count", "probability"])
+        for term_set_key, cnt in conn.execute(
+            "SELECT term_set_key, text_count FROM set_counts ORDER BY text_count DESC, term_set_key ASC"
+        ):
+            try:
+                set_size = len(json.loads(term_set_key))
+            except json.JSONDecodeError:
+                set_size = 0
+            p = (cnt / total_texts) if total_texts > 0 else 0.0
+            writer.writerow([term_set_key, set_size, cnt, p])
+
+    return set_types
+
+
 def run(args: argparse.Namespace) -> None:
     dictionary_terms = load_dictionary_terms(
         dictionary_csv=args.dictionary_csv,
@@ -230,7 +283,9 @@ def run(args: argparse.Namespace) -> None:
         "hobbies_and_interests",
     ]
 
-    term_set_counts: Counter[tuple[str, ...]] = Counter()
+    conn = setup_sqlite(args.sqlite_path)
+    set_insert_buffer: list[tuple[str]] = []
+    inserted_set_rows = 0
     total_texts = 0
     sampled_rows = 0
     started = time.time()
@@ -267,32 +322,37 @@ def run(args: argparse.Namespace) -> None:
                     fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     total_texts += 1
                     unique_sorted = sorted(set(terms))
-                    term_set_counts[tuple(unique_sorted)] += 1
+                    term_set_key = json.dumps(unique_sorted, ensure_ascii=False)
+                    set_insert_buffer.append((term_set_key,))
+                    if len(set_insert_buffer) >= args.sqlite_insert_buffer:
+                        flush_set_buffer(conn, set_insert_buffer)
+                        inserted_set_rows += args.sqlite_insert_buffer
 
                 if args.progress_every > 0 and sampled_rows % args.progress_every == 0:
                     elapsed = max(1e-9, time.time() - started)
                     rps = sampled_rows / elapsed
                     print(
                         f"[progress] sampled_rows={sampled_rows} total_texts={total_texts} "
-                        f"set_types={len(term_set_counts)} speed={rps:.2f} rows/s"
+                        f"inserted_sets={inserted_set_rows + len(set_insert_buffer)} "
+                        f"speed={rps:.2f} rows/s"
                     )
 
-    with args.term_output.open("w", encoding="utf-8", newline="") as fw:
-        writer = csv.writer(fw)
-        writer.writerow(["terms_json", "set_size", "text_count", "probability"])
-        for term_set, cnt in sorted(term_set_counts.items(), key=lambda x: (-x[1], x[0])):
-            p = (cnt / total_texts) if total_texts > 0 else 0.0
-            writer.writerow([json.dumps(list(term_set), ensure_ascii=False), len(term_set), cnt, p])
+    inserted_set_rows += len(set_insert_buffer)
+    flush_set_buffer(conn, set_insert_buffer)
+    set_types = export_set_probabilities(conn, total_texts=total_texts, output_path=args.term_output)
+    conn.close()
 
     elapsed = time.time() - started
     print(f"dictionary_terms={len(dictionary_terms)}")
     print(f"workers={workers}")
     print(f"sampled_rows={sampled_rows}")
     print(f"total_texts={total_texts}")
-    print(f"set_types={len(term_set_counts)}")
+    print(f"set_rows_inserted={inserted_set_rows}")
+    print(f"set_types={set_types}")
     print(f"elapsed_sec={elapsed:.2f}")
     print(f"text_output={args.text_output}")
     print(f"term_output={args.term_output}")
+    print(f"sqlite_path={args.sqlite_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -312,11 +372,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-rows", type=int, default=0, help="0で上限なし")
     p.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
-    p.add_argument("--row-batch-size", type=int, default=128, help="ワーカーへ渡す行バッチサイズ")
+    p.add_argument("--row-batch-size", type=int, default=256, help="ワーカーへ渡す行バッチサイズ")
     p.add_argument(
         "--pool-chunksize",
         type=int,
-        default=64,
+        default=128,
         help="imap_unordered の chunksize",
     )
     p.add_argument("--progress-every", type=int, default=100)
@@ -330,10 +390,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("nemotron_term_set_probabilities.csv"),
     )
+    p.add_argument(
+        "--sqlite-path",
+        type=Path,
+        default=Path("nemotron_term_sets.sqlite3"),
+        help="セット集計に使うSQLite DBパス",
+    )
+    p.add_argument(
+        "--sqlite-insert-buffer",
+        type=int,
+        default=20000,
+        help="SQLiteへ一括INSERTするバッファ行数",
+    )
     args = p.parse_args()
 
     if not (0.0 < args.sample_ratio <= 1.0):
         raise ValueError("--sample-ratio は 0.0 より大きく 1.0 以下で指定してください。")
+    if args.sqlite_insert_buffer <= 0:
+        raise ValueError("--sqlite-insert-buffer は1以上で指定してください。")
     return args
 
 

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
@@ -12,8 +13,8 @@ from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 from transformers import (
+    AutoModelForSequenceClassification,
     AutoTokenizer,
-    BertForSequenceClassification,
     DataCollatorWithPadding,
     Trainer,
     TrainerCallback,
@@ -215,9 +216,10 @@ def main() -> None:
     print(f"train={len(train_ds)} eval={len(eval_ds)}")
 
     print("[4/6] Loading tokenizer/model and tokenizing...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = BertForSequenceClassification.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name,
+        trust_remote_code=True,
         num_labels=1,
         problem_type="regression",
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
@@ -232,32 +234,39 @@ def main() -> None:
     eval_ds = eval_ds.remove_columns(["uuid", "field", "text"])
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.train_batch_size,
-        per_device_eval_batch_size=args.eval_batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_strategy="steps",
-        save_steps=args.eval_steps,
-        logging_strategy="steps",
-        logging_steps=args.eval_steps,
-        bf16=torch.cuda.is_available(),
-        report_to="none",
-        load_best_model_at_end=True,
-        metric_for_best_model="mse",
-        greater_is_better=False,
-        push_to_hub=bool(args.hub_repo),
-        hub_model_id=args.hub_repo,
-        hub_private_repo=args.hub_private,
-        hub_token=args.hub_token,
-        seed=args.seed,
-    )
+    ta_sig = inspect.signature(TrainingArguments.__init__).parameters
+    ta_kwargs: Dict[str, Any] = {
+        "output_dir": args.output_dir,
+        "num_train_epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.train_batch_size,
+        "per_device_eval_batch_size": args.eval_batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "eval_steps": args.eval_steps,
+        "save_steps": args.eval_steps,
+        "logging_steps": args.eval_steps,
+        "bf16": torch.cuda.is_available(),
+        "report_to": "none",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "mse",
+        "greater_is_better": False,
+        "push_to_hub": bool(args.hub_repo),
+        "hub_model_id": args.hub_repo,
+        "hub_private_repo": args.hub_private,
+        "hub_token": args.hub_token,
+        "seed": args.seed,
+    }
+    if "evaluation_strategy" in ta_sig:
+        ta_kwargs["evaluation_strategy"] = "steps"
+    elif "eval_strategy" in ta_sig:
+        ta_kwargs["eval_strategy"] = "steps"
+    if "save_strategy" in ta_sig:
+        ta_kwargs["save_strategy"] = "steps"
+    if "logging_strategy" in ta_sig:
+        ta_kwargs["logging_strategy"] = "steps"
+    training_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in ta_sig})
 
     print("[5/6] Fine-tuning BertForSequenceClassification...")
     trainer = Trainer(

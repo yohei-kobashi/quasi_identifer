@@ -6,11 +6,20 @@ import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
-from datasets import Dataset, Features, Sequence, Value, load_dataset
+from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoTokenizer
+from transformers import (
+    AutoTokenizer,
+    BertForSequenceClassification,
+    DataCollatorWithPadding,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    set_seed,
+)
 
 def _extract_uuid(record: Dict[str, Any]) -> Optional[str]:
     for key in ("uuid", "id", "record_id", "uid"):
@@ -34,48 +43,15 @@ def _extract_text(record: Dict[str, Any], field: str) -> Optional[str]:
     return str(value)
 
 
-def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-    masked = last_hidden_state * mask
-    summed = masked.sum(dim=1)
-    counts = mask.sum(dim=1).clamp(min=1e-9)
-    return summed / counts
-
-
-def _embed_texts(
-    texts: List[str],
-    tokenizer: AutoTokenizer,
-    model: AutoModel,
-    device: str,
-    batch_size: int,
-    max_length: int,
-) -> List[List[float]]:
-    vectors: List[List[float]] = []
-    model.eval()
-    total_batches = (len(texts) + batch_size - 1) // batch_size
-    with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size), total=total_batches, desc="Embedding batches"):
-            batch = texts[i : i + batch_size]
-            inputs = tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            outputs = model(**inputs)
-            pooled = _mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
-            vectors.extend(pooled.cpu().tolist())
-    return vectors
-
-
 def _build_xy_from_streaming_source(
     target_dataset: Dict[str, Dict[str, float]],
     source_dataset_name: str,
     source_split: str,
 ) -> Tuple[List[str], List[str], List[str], List[float]]:
     target_uuids = set(str(uuid) for uuid in target_dataset.keys())
+    remaining_pairs = {
+        (str(uuid), field) for uuid, fields in target_dataset.items() for field in fields.keys()
+    }
     uuid_list: List[str] = []
     field_list: List[str] = []
     text_list: List[str] = []
@@ -83,12 +59,16 @@ def _build_xy_from_streaming_source(
 
     stream = load_dataset(source_dataset_name, split=source_split, streaming=True)
     scan_bar = tqdm(stream, desc="Scanning source stream")
+    matched_uuids: set[str] = set()
     for record in scan_bar:
         uuid = _extract_uuid(record)
         if uuid is None or uuid not in target_uuids:
             continue
         fields = target_dataset.get(uuid, {})
         for field, y in fields.items():
+            pair = (uuid, field)
+            if pair not in remaining_pairs:
+                continue
             text = _extract_text(record, field)
             if text is None or not text.strip():
                 continue
@@ -96,27 +76,73 @@ def _build_xy_from_streaming_source(
             field_list.append(field)
             text_list.append(text)
             y_list.append(float(y))
+            remaining_pairs.remove(pair)
+            matched_uuids.add(uuid)
             if len(text_list) % 100 == 0:
-                scan_bar.set_postfix(matched=len(text_list), uuids=len(set(uuid_list)))
+                scan_bar.set_postfix(matched=len(text_list), uuids=len(matched_uuids), left=len(remaining_pairs))
+        if not remaining_pairs:
+            break
     return uuid_list, field_list, text_list, y_list
+
+
+def _compute_metrics(eval_pred: Tuple[Any, Any]) -> Dict[str, float]:
+    predictions, labels = eval_pred
+    preds = predictions.reshape(-1)
+    labels = labels.reshape(-1)
+    if preds.size > 1 and float(np.std(preds)) > 0.0 and float(np.std(labels)) > 0.0:
+        pearson = float(np.corrcoef(preds, labels)[0, 1])
+    else:
+        pearson = 0.0
+    mse = float(((preds - labels) ** 2).mean())
+    mae = float(abs(preds - labels).mean())
+    return {"mse": mse, "mae": mae, "pearson": pearson}
+
+
+class StepMetricsPrinterCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        step = int(state.global_step)
+        train_loss = logs.get("loss")
+        eval_loss = logs.get("eval_loss")
+        eval_pearson = logs.get("eval_pearson")
+        if train_loss is not None:
+            print(f"[step {step}] train_loss={train_loss:.6f}")
+        if eval_loss is not None or eval_pearson is not None:
+            msg = f"[step {step}]"
+            if eval_loss is not None:
+                msg += f" eval_loss={eval_loss:.6f}"
+            if eval_pearson is not None:
+                msg += f" eval_pearson={eval_pearson:.6f}"
+            print(msg)
 
 
 def main() -> None:
     load_dotenv(dotenv_path=".env", override=False)
 
-    parser = argparse.ArgumentParser(description="Build X/y and upload to Hugging Face Hub.")
+    parser = argparse.ArgumentParser(description="Fine-tune BertForSequenceClassification for y regression.")
     parser.add_argument("--source-dataset", default="nvidia/Nemotron-Personas-Japan")
     parser.add_argument("--source-split", default="train")
-    parser.add_argument("--embedding-model", default="sbintuitions/modernbert-ja-310m")
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--model-name", default="sbintuitions/modernbert-ja-310m")
+    parser.add_argument("--train-batch-size", type=int, default=64)
+    parser.add_argument("--eval-batch-size", type=int, default=64)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=float, default=3.0)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.1)
+    parser.add_argument("--eval-ratio", type=float, default=0.1)
+    parser.add_argument("--eval-steps", type=int, default=100)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=512)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--output-dir", default="./outputs/bert_regression")
     parser.add_argument("--hub-repo", default=os.environ.get("HF_OUTPUT_REPO"))
     parser.add_argument("--hub-private", action="store_true")
     parser.add_argument("--hub-token", default=os.environ.get("HF_TOKEN"))
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    random.seed(42)
+    random.seed(args.seed)
+    set_seed(args.seed)
     print("[1/6] Building y targets from local files...")
 
     # terms_json,set_size,text_count,probability
@@ -174,55 +200,88 @@ def main() -> None:
         raise RuntimeError("No training records were matched from the streaming source dataset.")
     print(f"Collected pairs: {len(text_list)}")
 
-    print("[3/6] Loading embedding model/tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.embedding_model,
-        trust_remote_code=True,
+    print("[3/6] Building train/eval dataset...")
+    raw_dataset = Dataset.from_dict(
+        {
+            "uuid": uuid_list,
+            "field": field_list,
+            "text": text_list,
+            "labels": [float(v) for v in y_list],
+        }
     )
-    model = AutoModel.from_pretrained(
-        args.embedding_model,
-        trust_remote_code=True,
-        attn_implementation="eager",
-        torch_dtype=torch.bfloat16 if args.device.startswith("cuda") else None,
-    ).to(args.device)
-    print("[4/6] Encoding texts into embeddings...")
-    x_vectors = _embed_texts(
-        texts=text_list,
-        tokenizer=tokenizer,
+    split = raw_dataset.train_test_split(test_size=args.eval_ratio, seed=args.seed, shuffle=True)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+    print(f"train={len(train_ds)} eval={len(eval_ds)}")
+
+    print("[4/6] Loading tokenizer/model and tokenizing...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = BertForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=1,
+        problem_type="regression",
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+    )
+
+    def _tokenize(batch: Dict[str, List[str]]) -> Dict[str, Any]:
+        return tokenizer(batch["text"], truncation=True, max_length=args.max_length)
+
+    train_ds = train_ds.map(_tokenize, batched=True, desc="Tokenizing train split")
+    eval_ds = eval_ds.map(_tokenize, batched=True, desc="Tokenizing eval split")
+    train_ds = train_ds.remove_columns(["uuid", "field", "text"])
+    eval_ds = eval_ds.remove_columns(["uuid", "field", "text"])
+
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.train_batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        evaluation_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_strategy="steps",
+        save_steps=args.eval_steps,
+        logging_strategy="steps",
+        logging_steps=args.eval_steps,
+        bf16=torch.cuda.is_available(),
+        report_to="none",
+        load_best_model_at_end=True,
+        metric_for_best_model="mse",
+        greater_is_better=False,
+        push_to_hub=bool(args.hub_repo),
+        hub_model_id=args.hub_repo,
+        hub_private_repo=args.hub_private,
+        hub_token=args.hub_token,
+        seed=args.seed,
+    )
+
+    print("[5/6] Fine-tuning BertForSequenceClassification...")
+    trainer = Trainer(
         model=model,
-        device=args.device,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=_compute_metrics,
+        callbacks=[StepMetricsPrinterCallback()],
     )
-    print(f"Embedding size: {len(x_vectors[0])}")
+    trainer.train()
+    metrics = trainer.evaluate()
+    print(f"eval metrics: {metrics}")
 
-    print("[5/6] Building Hugging Face dataset object...")
-    rows = []
-    for uuid, field, text, x, y in tqdm(
-        zip(uuid_list, field_list, text_list, x_vectors, y_list),
-        total=len(y_list),
-        desc="Assembling rows",
-    ):
-        rows.append({"uuid": uuid, "field": field, "text": text, "x": x, "y": y})
-    feature_size = len(x_vectors[0])
-    hf_dataset = Dataset.from_list(
-        rows,
-        features=Features(
-            {
-                "uuid": Value("string"),
-                "field": Value("string"),
-                "text": Value("string"),
-                "x": Sequence(Value("float32"), length=feature_size),
-                "y": Value("float32"),
-            }
-        ),
-    )
-
-    if not args.hub_repo:
-        raise ValueError("Please set --hub-repo or HF_OUTPUT_REPO to upload the dataset.")
-    print(f"[6/6] Uploading to hub: {args.hub_repo}")
-    hf_dataset.push_to_hub(args.hub_repo, private=args.hub_private, token=args.hub_token)
-    print(f"Uploaded {len(hf_dataset)} rows to {args.hub_repo}")
+    print("[6/6] Saving and uploading model...")
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    if args.hub_repo:
+        trainer.push_to_hub()
+        print(f"Uploaded fine-tuned model to {args.hub_repo}")
+    else:
+        print(f"Model saved locally at {args.output_dir} (set HF_OUTPUT_REPO or --hub-repo to upload)")
 
 
 if __name__ == "__main__":

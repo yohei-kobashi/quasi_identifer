@@ -175,8 +175,16 @@ def main() -> None:
     print(f"Collected pairs: {len(text_list)}")
 
     print("[3/6] Loading embedding model/tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.embedding_model)
-    model = AutoModel.from_pretrained(args.embedding_model).to(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.embedding_model,
+        trust_remote_code=True,
+    )
+    model = AutoModel.from_pretrained(
+        args.embedding_model,
+        trust_remote_code=True,
+        attn_implementation="eager",
+        torch_dtype=torch.bfloat16 if args.device.startswith("cuda") else None,
+    ).to(args.device)
     print("[4/6] Encoding texts into embeddings...")
     x_vectors = _embed_texts(
         texts=text_list,

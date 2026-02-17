@@ -130,13 +130,13 @@ def main() -> None:
                 freq[n] = {"morphemes":[], "prob":float(row[3]), "samples":[]}
             mor = json.loads(row[0])
             freq[n]["morphemes"].append(mor)
-            mor2n[tuple(mor)] = n
+            mor2n[tuple(sorted(mor))] = n
             max_p = max(max_p, freq[n]["prob"])
 
     no_PIIs = []
     for row in tqdm(open("nemotron_text_dictionary_terms.jsonl", "r"), desc="Reading dictionary terms JSONL"):
         data = json.loads(row)
-        n = mor2n[tuple(data["matched_terms"])]
+        n = mor2n[tuple(sorted(data["matched_terms"]))]
         if len(data["matched_terms"]):
             freq[n]["samples"].append((data["uuid"], data["field"]))
         else:

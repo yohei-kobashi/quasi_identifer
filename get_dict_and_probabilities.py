@@ -234,6 +234,9 @@ def main() -> None:
     eval_ds = eval_ds.remove_columns(["uuid", "field", "text"])
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
+    steps_per_epoch = max(1, len(train_ds) // max(1, args.train_batch_size * args.grad_accum))
+    total_steps = max(1, int(steps_per_epoch * args.epochs))
+    warmup_steps = int(total_steps * args.warmup_ratio)
     ta_sig = inspect.signature(TrainingArguments.__init__).parameters
     ta_kwargs: Dict[str, Any] = {
         "output_dir": args.output_dir,
@@ -243,7 +246,7 @@ def main() -> None:
         "per_device_eval_batch_size": args.eval_batch_size,
         "gradient_accumulation_steps": args.grad_accum,
         "weight_decay": args.weight_decay,
-        "warmup_ratio": args.warmup_ratio,
+        "warmup_steps": warmup_steps,
         "eval_steps": args.eval_steps,
         "save_steps": args.eval_steps,
         "logging_steps": args.eval_steps,
@@ -269,16 +272,21 @@ def main() -> None:
     training_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in ta_sig})
 
     print("[5/6] Fine-tuning BertForSequenceClassification...")
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=_compute_metrics,
-        callbacks=[StepMetricsPrinterCallback()],
-    )
+    trainer_sig = inspect.signature(Trainer.__init__).parameters
+    trainer_kwargs: Dict[str, Any] = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "data_collator": data_collator,
+        "compute_metrics": _compute_metrics,
+        "callbacks": [StepMetricsPrinterCallback()],
+    }
+    if "tokenizer" in trainer_sig:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig:
+        trainer_kwargs["processing_class"] = tokenizer
+    trainer = Trainer(**trainer_kwargs)
     trainer.train()
     metrics = trainer.evaluate()
     print(f"eval metrics: {metrics}")

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from datasets import Dataset, Features, Sequence, Value, load_dataset
 from dotenv import load_dotenv
+from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 def _extract_uuid(record: Dict[str, Any]) -> Optional[str]:
@@ -51,8 +52,9 @@ def _embed_texts(
 ) -> List[List[float]]:
     vectors: List[List[float]] = []
     model.eval()
+    total_batches = (len(texts) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
+        for i in tqdm(range(0, len(texts), batch_size), total=total_batches, desc="Embedding batches"):
             batch = texts[i : i + batch_size]
             inputs = tokenizer(
                 batch,
@@ -80,7 +82,8 @@ def _build_xy_from_streaming_source(
     y_list: List[float] = []
 
     stream = load_dataset(source_dataset_name, split=source_split, streaming=True)
-    for record in stream:
+    scan_bar = tqdm(stream, desc="Scanning source stream")
+    for record in scan_bar:
         uuid = _extract_uuid(record)
         if uuid is None or uuid not in target_uuids:
             continue
@@ -93,6 +96,8 @@ def _build_xy_from_streaming_source(
             field_list.append(field)
             text_list.append(text)
             y_list.append(float(y))
+            if len(text_list) % 100 == 0:
+                scan_bar.set_postfix(matched=len(text_list), uuids=len(set(uuid_list)))
     return uuid_list, field_list, text_list, y_list
 
 
@@ -103,7 +108,7 @@ def main() -> None:
     parser.add_argument("--source-dataset", default="nvidia/Nemotron-Personas-Japan")
     parser.add_argument("--source-split", default="train")
     parser.add_argument("--embedding-model", default="sbintuitions/modernbert-ja-310m")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--hub-repo", default=os.environ.get("HF_OUTPUT_REPO"))
@@ -112,12 +117,13 @@ def main() -> None:
     args = parser.parse_args()
 
     random.seed(42)
+    print("[1/6] Building y targets from local files...")
 
     # terms_json,set_size,text_count,probability
     freq = {}
     mor2n = {}
     max_p = 0
-    for i,row in enumerate(csv.reader(open("nemotron_term_set_probabilities.csv", "r"))):
+    for i,row in enumerate(tqdm(csv.reader(open("nemotron_term_set_probabilities.csv", "r")), desc="Reading probabilities CSV")):
         if i:
             n = float(row[2])
             if not n in freq:
@@ -128,7 +134,7 @@ def main() -> None:
             max_p = max(max_p, freq[n]["prob"])
 
     no_PIIs = []
-    for row in open("nemotron_text_dictionary_terms.jsonl", "r"):
+    for row in tqdm(open("nemotron_text_dictionary_terms.jsonl", "r"), desc="Reading dictionary terms JSONL"):
         data = json.loads(row)
         n = mor2n[tuple(data["matched_terms"])]
         if len(data["matched_terms"]):
@@ -138,7 +144,7 @@ def main() -> None:
 
     total_sample_n = 0
     dataset = {}
-    for n,v in freq.items():
+    for n,v in tqdm(freq.items(), total=len(freq), desc="Sampling PII candidates"):
         # random.sample expects an integer k and k must not exceed len(samples)
         sample_base = max(1.0, n * len(v["morphemes"]))
         sample_n = int(max(1, math.log(sample_base)))
@@ -152,11 +158,13 @@ def main() -> None:
         total_sample_n += freq[n]["sample_n"]
 
     total_sample_n = min(total_sample_n, len(no_PIIs))
-    for uuid, field in random.sample(no_PIIs, total_sample_n):
+    for uuid, field in tqdm(random.sample(no_PIIs, total_sample_n), desc="Sampling non-PII candidates"):
         if not uuid in dataset:
             dataset[uuid] = {}
         dataset[uuid][field] = 0
+    print(f"Built target dataset: {len(dataset)} uuids")
 
+    print("[2/6] Streaming source dataset and collecting matched texts...")
     uuid_list, field_list, text_list, y_list = _build_xy_from_streaming_source(
         target_dataset=dataset,
         source_dataset_name=args.source_dataset,
@@ -164,9 +172,12 @@ def main() -> None:
     )
     if not text_list:
         raise RuntimeError("No training records were matched from the streaming source dataset.")
+    print(f"Collected pairs: {len(text_list)}")
 
+    print("[3/6] Loading embedding model/tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.embedding_model)
     model = AutoModel.from_pretrained(args.embedding_model).to(args.device)
+    print("[4/6] Encoding texts into embeddings...")
     x_vectors = _embed_texts(
         texts=text_list,
         tokenizer=tokenizer,
@@ -175,9 +186,15 @@ def main() -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
     )
+    print(f"Embedding size: {len(x_vectors[0])}")
 
+    print("[5/6] Building Hugging Face dataset object...")
     rows = []
-    for uuid, field, text, x, y in zip(uuid_list, field_list, text_list, x_vectors, y_list):
+    for uuid, field, text, x, y in tqdm(
+        zip(uuid_list, field_list, text_list, x_vectors, y_list),
+        total=len(y_list),
+        desc="Assembling rows",
+    ):
         rows.append({"uuid": uuid, "field": field, "text": text, "x": x, "y": y})
     feature_size = len(x_vectors[0])
     hf_dataset = Dataset.from_list(
@@ -195,6 +212,7 @@ def main() -> None:
 
     if not args.hub_repo:
         raise ValueError("Please set --hub-repo or HF_OUTPUT_REPO to upload the dataset.")
+    print(f"[6/6] Uploading to hub: {args.hub_repo}")
     hf_dataset.push_to_hub(args.hub_repo, private=args.hub_private, token=args.hub_token)
     print(f"Uploaded {len(hf_dataset)} rows to {args.hub_repo}")
 

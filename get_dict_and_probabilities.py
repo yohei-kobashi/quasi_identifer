@@ -128,7 +128,7 @@ def main() -> None:
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--epochs", type=float, default=5.0)
+    parser.add_argument("--epochs", type=float, default=10.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--eval-ratio", type=float, default=0.1)
@@ -174,7 +174,7 @@ def main() -> None:
     for n,v in tqdm(freq.items(), total=len(freq), desc="Sampling PII candidates"):
         # random.sample expects an integer k and k must not exceed len(samples)
         sample_base = max(1.0, n * len(v["morphemes"]))
-        sample_n = int(math.log(sample_base) * 20)
+        sample_n = int(math.log(sample_base) * 10)
         sample_n = min(sample_n, len(freq[n]["samples"]))
         freq[n]["sample_n"] = sample_n
         freq[n]["samples"] = random.sample(freq[n]["samples"], sample_n)
@@ -247,9 +247,6 @@ def main() -> None:
         "gradient_accumulation_steps": args.grad_accum,
         "weight_decay": args.weight_decay,
         "warmup_steps": warmup_steps,
-        "eval_steps": args.eval_steps,
-        "save_steps": args.eval_steps,
-        "logging_steps": args.eval_steps,
         "bf16": torch.cuda.is_available(),
         "report_to": "none",
         "load_best_model_at_end": True,
@@ -262,13 +259,13 @@ def main() -> None:
         "seed": args.seed,
     }
     if "evaluation_strategy" in ta_sig:
-        ta_kwargs["evaluation_strategy"] = "steps"
+        ta_kwargs["evaluation_strategy"] = "epoch"
     elif "eval_strategy" in ta_sig:
-        ta_kwargs["eval_strategy"] = "steps"
+        ta_kwargs["eval_strategy"] = "epoch"
     if "save_strategy" in ta_sig:
-        ta_kwargs["save_strategy"] = "steps"
+        ta_kwargs["save_strategy"] = "epoch"
     if "logging_strategy" in ta_sig:
-        ta_kwargs["logging_strategy"] = "steps"
+        ta_kwargs["logging_strategy"] = "epoch"
     training_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in ta_sig})
 
     print("[5/6] Fine-tuning BertForSequenceClassification...")

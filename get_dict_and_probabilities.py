@@ -174,7 +174,7 @@ def main() -> None:
     for n,v in tqdm(freq.items(), total=len(freq), desc="Sampling PII candidates"):
         # random.sample expects an integer k and k must not exceed len(samples)
         sample_base = max(1.0, n * len(v["morphemes"]))
-        sample_n = int(math.log(sample_base))
+        sample_n = int(math.log(sample_base) * 20)
         sample_n = min(sample_n, len(freq[n]["samples"]))
         freq[n]["sample_n"] = sample_n
         freq[n]["samples"] = random.sample(freq[n]["samples"], sample_n)

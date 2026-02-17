@@ -135,6 +135,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--num-folds", type=int, default=5)
+    parser.add_argument("--skip-cv", action="store_true")
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--output-dir", default="./outputs/bert_regression")
@@ -227,102 +228,145 @@ def main() -> None:
     ta_sig = inspect.signature(TrainingArguments.__init__).parameters
     trainer_sig = inspect.signature(Trainer.__init__).parameters
     all_metrics: List[Dict[str, float]] = []
-    best_fold = None
-    best_pearson = -1e9
-    best_output_dir = None
 
-    print("[5/6] Fine-tuning with K-fold CV...")
-    indices = np.arange(len(tokenized_ds))
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(indices)
-    folds = np.array_split(indices, args.num_folds)
-    for fold_idx in range(args.num_folds):
-        eval_idx = folds[fold_idx].tolist()
-        train_idx = np.concatenate([folds[i] for i in range(args.num_folds) if i != fold_idx]).tolist()
-        train_ds = tokenized_ds.select(train_idx)
-        eval_ds = tokenized_ds.select(eval_idx)
-        fold_seed = args.seed + fold_idx
-        set_seed(fold_seed)
-        run_output_dir = os.path.join(args.output_dir, f"fold_{fold_idx + 1}")
-        steps_per_epoch = max(1, len(train_ds) // max(1, args.train_batch_size * args.grad_accum))
-        total_steps = max(1, int(steps_per_epoch * args.epochs))
-        warmup_steps = int(total_steps * args.warmup_ratio)
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name,
-            trust_remote_code=True,
-            num_labels=1,
-            problem_type="regression",
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-        )
-
-        ta_kwargs: Dict[str, Any] = {
-            "output_dir": run_output_dir,
-            "num_train_epochs": args.epochs,
-            "learning_rate": args.learning_rate,
-            "per_device_train_batch_size": args.train_batch_size,
-            "per_device_eval_batch_size": args.eval_batch_size,
-            "gradient_accumulation_steps": args.grad_accum,
-            "weight_decay": args.weight_decay,
-            "warmup_steps": warmup_steps,
-            "bf16": torch.cuda.is_available(),
-            "report_to": "none",
-            "load_best_model_at_end": True,
-            "metric_for_best_model": "mse",
-            "greater_is_better": False,
-            "push_to_hub": False,
-            "seed": fold_seed,
-        }
-        if "evaluation_strategy" in ta_sig:
-            ta_kwargs["evaluation_strategy"] = "epoch"
-        elif "eval_strategy" in ta_sig:
-            ta_kwargs["eval_strategy"] = "epoch"
-        if "save_strategy" in ta_sig:
-            ta_kwargs["save_strategy"] = "epoch"
-        if "logging_strategy" in ta_sig:
-            ta_kwargs["logging_strategy"] = "epoch"
-        training_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in ta_sig})
-
-        trainer_kwargs: Dict[str, Any] = {
-            "model": model,
-            "args": training_args,
-            "train_dataset": train_ds,
-            "eval_dataset": eval_ds,
-            "data_collator": data_collator,
-            "compute_metrics": _compute_metrics,
-            "callbacks": [StepMetricsPrinterCallback(fold=fold_idx + 1)],
-        }
-        if "tokenizer" in trainer_sig:
-            trainer_kwargs["tokenizer"] = tokenizer
-        elif "processing_class" in trainer_sig:
-            trainer_kwargs["processing_class"] = tokenizer
-        trainer = Trainer(**trainer_kwargs)
-        trainer.train()
-        metrics = trainer.evaluate()
-        eval_pearson = float(metrics.get("eval_pearson", 0.0))
-        eval_loss = float(metrics.get("eval_loss", 0.0))
-        all_metrics.append({"fold": float(fold_idx + 1), "eval_pearson": eval_pearson, "eval_loss": eval_loss})
-        print(f"[fold {fold_idx + 1}] eval metrics: {metrics}")
-
-        if eval_pearson > best_pearson:
-            best_pearson = eval_pearson
-            best_fold = fold_idx + 1
-            best_output_dir = run_output_dir
-
-    mean_pearson = sum(m["eval_pearson"] for m in all_metrics) / len(all_metrics)
-    mean_eval_loss = sum(m["eval_loss"] for m in all_metrics) / len(all_metrics)
-    print(f"{args.num_folds}-fold average: eval_pearson={mean_pearson:.6f}, eval_loss={mean_eval_loss:.6f}")
-
-    print("[6/6] Saving and uploading best-fold model...")
-    print(f"Best fold: {best_fold} (eval_pearson={best_pearson:.6f})")
-    if best_output_dir:
-        tokenizer.save_pretrained(best_output_dir)
-    if args.hub_repo and best_output_dir:
-        best_model = AutoModelForSequenceClassification.from_pretrained(best_output_dir, trust_remote_code=True)
-        best_model.push_to_hub(args.hub_repo, private=args.hub_private, token=args.hub_token)
-        tokenizer.push_to_hub(args.hub_repo, private=args.hub_private, token=args.hub_token)
-        print(f"Uploaded best-fold model to {args.hub_repo}")
+    if args.skip_cv:
+        print("[5/6] Skipping K-fold CV (--skip-cv enabled)")
     else:
-        print(f"Best model saved locally under {args.output_dir} (set HF_OUTPUT_REPO or --hub-repo to upload)")
+        print("[5/6] Fine-tuning with K-fold CV...")
+        indices = np.arange(len(tokenized_ds))
+        rng = np.random.default_rng(args.seed)
+        rng.shuffle(indices)
+        folds = np.array_split(indices, args.num_folds)
+        for fold_idx in range(args.num_folds):
+            eval_idx = folds[fold_idx].tolist()
+            train_idx = np.concatenate([folds[i] for i in range(args.num_folds) if i != fold_idx]).tolist()
+            train_ds = tokenized_ds.select(train_idx)
+            eval_ds = tokenized_ds.select(eval_idx)
+            fold_seed = args.seed + fold_idx
+            set_seed(fold_seed)
+            run_output_dir = os.path.join(args.output_dir, f"fold_{fold_idx + 1}")
+            steps_per_epoch = max(1, len(train_ds) // max(1, args.train_batch_size * args.grad_accum))
+            total_steps = max(1, int(steps_per_epoch * args.epochs))
+            warmup_steps = int(total_steps * args.warmup_ratio)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                args.model_name,
+                trust_remote_code=True,
+                num_labels=1,
+                problem_type="regression",
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+            )
+
+            ta_kwargs: Dict[str, Any] = {
+                "output_dir": run_output_dir,
+                "num_train_epochs": args.epochs,
+                "learning_rate": args.learning_rate,
+                "per_device_train_batch_size": args.train_batch_size,
+                "per_device_eval_batch_size": args.eval_batch_size,
+                "gradient_accumulation_steps": args.grad_accum,
+                "weight_decay": args.weight_decay,
+                "warmup_steps": warmup_steps,
+                "bf16": torch.cuda.is_available(),
+                "report_to": "none",
+                "load_best_model_at_end": True,
+                "metric_for_best_model": "mse",
+                "greater_is_better": False,
+                "push_to_hub": False,
+                "seed": fold_seed,
+            }
+            if "evaluation_strategy" in ta_sig:
+                ta_kwargs["evaluation_strategy"] = "epoch"
+            elif "eval_strategy" in ta_sig:
+                ta_kwargs["eval_strategy"] = "epoch"
+            if "save_strategy" in ta_sig:
+                ta_kwargs["save_strategy"] = "epoch"
+            if "logging_strategy" in ta_sig:
+                ta_kwargs["logging_strategy"] = "epoch"
+            training_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in ta_sig})
+
+            trainer_kwargs: Dict[str, Any] = {
+                "model": model,
+                "args": training_args,
+                "train_dataset": train_ds,
+                "eval_dataset": eval_ds,
+                "data_collator": data_collator,
+                "compute_metrics": _compute_metrics,
+                "callbacks": [StepMetricsPrinterCallback(fold=fold_idx + 1)],
+            }
+            if "tokenizer" in trainer_sig:
+                trainer_kwargs["tokenizer"] = tokenizer
+            elif "processing_class" in trainer_sig:
+                trainer_kwargs["processing_class"] = tokenizer
+            trainer = Trainer(**trainer_kwargs)
+            trainer.train()
+            metrics = trainer.evaluate()
+            eval_pearson = float(metrics.get("eval_pearson", 0.0))
+            eval_loss = float(metrics.get("eval_loss", 0.0))
+            all_metrics.append({"fold": float(fold_idx + 1), "eval_pearson": eval_pearson, "eval_loss": eval_loss})
+            print(f"[fold {fold_idx + 1}] eval metrics: {metrics}")
+
+        mean_pearson = sum(m["eval_pearson"] for m in all_metrics) / len(all_metrics)
+        mean_eval_loss = sum(m["eval_loss"] for m in all_metrics) / len(all_metrics)
+        print(f"{args.num_folds}-fold average: eval_pearson={mean_pearson:.6f}, eval_loss={mean_eval_loss:.6f}")
+
+    print("[6/6] Training final model on full dataset and saving...")
+    final_output_dir = os.path.join(args.output_dir, "final_full_data")
+    set_seed(args.seed)
+    final_model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        trust_remote_code=True,
+        num_labels=1,
+        problem_type="regression",
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+    )
+    final_steps_per_epoch = max(1, len(tokenized_ds) // max(1, args.train_batch_size * args.grad_accum))
+    final_total_steps = max(1, int(final_steps_per_epoch * args.epochs))
+    final_warmup_steps = int(final_total_steps * args.warmup_ratio)
+    final_ta_kwargs: Dict[str, Any] = {
+        "output_dir": final_output_dir,
+        "num_train_epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.train_batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "weight_decay": args.weight_decay,
+        "warmup_steps": final_warmup_steps,
+        "bf16": torch.cuda.is_available(),
+        "report_to": "none",
+        "load_best_model_at_end": False,
+        "push_to_hub": bool(args.hub_repo),
+        "hub_model_id": args.hub_repo,
+        "hub_private_repo": args.hub_private,
+        "hub_token": args.hub_token,
+        "seed": args.seed,
+    }
+    if "evaluation_strategy" in ta_sig:
+        final_ta_kwargs["evaluation_strategy"] = "no"
+    elif "eval_strategy" in ta_sig:
+        final_ta_kwargs["eval_strategy"] = "no"
+    if "save_strategy" in ta_sig:
+        final_ta_kwargs["save_strategy"] = "epoch"
+    if "logging_strategy" in ta_sig:
+        final_ta_kwargs["logging_strategy"] = "epoch"
+    final_training_args = TrainingArguments(**{k: v for k, v in final_ta_kwargs.items() if k in ta_sig})
+    final_trainer_kwargs: Dict[str, Any] = {
+        "model": final_model,
+        "args": final_training_args,
+        "train_dataset": tokenized_ds,
+        "data_collator": data_collator,
+        "callbacks": [StepMetricsPrinterCallback(fold=0)],
+    }
+    if "tokenizer" in trainer_sig:
+        final_trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig:
+        final_trainer_kwargs["processing_class"] = tokenizer
+    final_trainer = Trainer(**final_trainer_kwargs)
+    final_trainer.train()
+    final_trainer.save_model(final_output_dir)
+    tokenizer.save_pretrained(final_output_dir)
+    if args.hub_repo:
+        final_trainer.push_to_hub()
+        print(f"Uploaded final full-data model to {args.hub_repo}")
+    else:
+        print(f"Final model saved locally under {final_output_dir} (set HF_OUTPUT_REPO or --hub-repo to upload)")
 
 
 if __name__ == "__main__":

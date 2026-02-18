@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""annotations_BERT.jsonl を処理して PROFILE 優位語を抽出する。"""
+"""
+annotations_BERT.jsonl を形態素解析し、PROFILE 側で有意に多い語を抽出するスクリプト。
+
+処理概要:
+1. JSONL の各行から `label` と `clause` を読み取り、対象ラベル (PROFILE/NONE) を集計する。
+2. fugashi + UniDic でトークン化し、機能語や非自立語を除外して自立語のみを数える。
+3. 必要に応じて Nemotron データセットの skills/hobbies リストを PROFILE 側語彙に加算する。
+4. 各語について 2x2 分割表を作り、G-test (LLR)・p 値・オッズ比を計算する。
+5. PROFILE 比率が NONE を上回り、有意水準 5% を満たす語だけを CSV に出力する。
+
+主な出力:
+- `profile_significant_morphemes.csv` (語、各ラベルの頻度/比率、odds ratio、LLR、p 値)
+- 実行ログ (処理件数、スキップ件数、トークン総数、抽出語数 など)
+"""
 
 from __future__ import annotations
 

@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Nemotron ペルソナ文を句単位に分割し、PII/PROFILE/NONE を付与して JSONL に追記するスクリプト。
+
+処理概要:
+1. Hugging Face `nvidia/Nemotron-Personas-Japan` を読み込み、対象 split を選択する。
+2. 指定フィールドのテキストを正規化し、句点ベースで clause に分割する。
+3. 各 clause を OpenAI API に送り、`PII` / `PROFILE` / `NONE` を1ラベル分類する。
+4. 既存出力ファイルを読み込んで `(uuid, clause)` の重複をスキップする。
+5. `row_index`, `uuid`, `field`, `clause`, `label` を JSONL 形式で追記保存する。
+
+主な用途:
+- ペルソナ文の準識別子アノテーション作成
+- 後続の語彙統計・有意差分析用データの作成
+"""
 
 import argparse
 import json

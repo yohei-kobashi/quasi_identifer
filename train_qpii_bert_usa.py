@@ -163,6 +163,12 @@ def build_model(model_name: str, num_labels: int, id2label: Dict[int, str],
     # 重みは fp32 でロードし、混合精度は TrainingArguments の bf16=True(autocast)で行う。
     # こうすると fp32 マスター重みが保たれ、DeBERTa-v3 等でも安定して収束する
     # (torch_dtype=bf16 でロードすると純bf16学習になり不安定になりやすい)。
+    extra: Dict[str, Any] = {}
+    # ModernBERT は既定で reference_compile(torch.compile)を使い、Triton/Inductor が
+    # gcc で Python.h(開発ヘッダ)を要求する。ヘッダが無い環境ではJITに失敗するため無効化。
+    # (eager 実行になり多少遅くなるだけで精度には影響しない)
+    if "modernbert" in model_name.lower():
+        extra["reference_compile"] = False
     return AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=num_labels,
@@ -170,6 +176,7 @@ def build_model(model_name: str, num_labels: int, id2label: Dict[int, str],
         label2id=label2id,
         problem_type="single_label_classification",
         trust_remote_code=True,
+        **extra,
     )
 
 

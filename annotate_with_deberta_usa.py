@@ -325,6 +325,35 @@ def load_annotated_uuids(path: str) -> set:
     return uuids
 
 
+def prepare_resume(path: str) -> set:
+    """既存の出力から完了済み uuid 集合を返し、末尾ブロックを切り詰める。
+
+    レコード(uuid)は出力上で連続して書かれる。中断時は最後の uuid ブロックが
+    未完の可能性があるため、その先頭バイト位置まで truncate して取り除き(=再処理対象)、
+    それ以前の uuid のみを「完了済み」として返す。これで重複も欠落も生じない。
+    """
+    done: List[str] = []
+    last_uuid: Optional[str] = None
+    block_start = 0
+    offset = 0
+    with open(path, "rb") as f:
+        for raw in f:
+            try:
+                u = json.loads(raw).get("uuid")
+            except Exception:
+                u = None
+            u = str(u) if u is not None else None
+            if u != last_uuid:
+                if last_uuid is not None:
+                    done.append(last_uuid)
+                block_start = offset      # 新しい uuid ブロックの開始バイト位置
+                last_uuid = u
+            offset += len(raw)
+    # 末尾(最後の uuid)ブロックは未完の可能性 → 切り詰めて再処理対象にする
+    os.truncate(path, block_start)
+    return set(done)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Annotate Nemotron-Personas-USA clauses with a trained DeBERTa classifier.")
@@ -347,6 +376,9 @@ def main() -> None:
     parser.add_argument("--skip-uuids-from", default="annotations_usa2.jsonl",
                         help="このJSONLに含まれる uuid のレコードはスキップ(学習済み分の重複回避)。"
                              "空文字('')でスキップ無効")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="既存の --output から再開(済みuuidをスキップして追記)。"
+                             "--no-resume で先頭から上書き")
     parser.add_argument("--max-rows", type=int, default=0, help="0で全件。>0で先頭N行のみ(動作確認用)")
     parser.add_argument("--progress-every", type=int, default=20000, help="N節ごとに進捗表示")
     args = parser.parse_args()
@@ -381,6 +413,15 @@ def main() -> None:
     elif args.skip_uuids_from:
         print(f"[skip] {args.skip_uuids_from} が見つからない/空 → スキップ無し")
 
+    # ── 中断からの再開(既存 --output の済み uuid をスキップして追記) ──────────
+    file_mode = "w"
+    if args.resume and os.path.exists(args.output) and os.path.getsize(args.output) > 0:
+        done_uuids = prepare_resume(args.output)
+        skip_uuids |= done_uuids
+        file_mode = "a"
+        print(f"[resume] 既存出力から {len(done_uuids)} uuid 完了済み → 追記再開 "
+              f"({args.output})。末尾の未完uuidは安全のため再処理")
+
     # ── データ ────────────────────────────────────────────────────────────
     from datasets import load_dataset
     stream = load_dataset(args.dataset, split=args.split, streaming=not args.no_streaming)
@@ -391,7 +432,7 @@ def main() -> None:
     n_clauses = 0
     started = time.time()
 
-    with open(args.output, "w", encoding="utf-8") as fw:
+    with open(args.output, file_mode, encoding="utf-8") as fw:
         for i, row in enumerate(tqdm(stream, desc="Records")):
             if args.max_rows and i >= args.max_rows:
                 break
@@ -408,12 +449,15 @@ def main() -> None:
                         n_clauses += 1
             if len(pool) >= sort_pool:
                 flush_pool(pool, fw, model, tokenizer, device, args, id2label, use_amp)
+                fw.flush()
+                os.fsync(fw.fileno())  # 中断時に完了レコードのみがディスクに残るよう確実化
                 pool = []
                 if args.progress_every and n_clauses % args.progress_every < sort_pool:
                     el = max(1e-9, time.time() - started)
                     print(f"[progress] rows={n_rows} clauses={n_clauses} "
                           f"{n_clauses / el:.0f} clause/s")
         flush_pool(pool, fw, model, tokenizer, device, args, id2label, use_amp)
+        fw.flush()
 
     el = time.time() - started
     print(f"\nrows_annotated={n_rows} skipped_uuids={n_skipped} clauses={n_clauses} "

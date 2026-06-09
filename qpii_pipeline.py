@@ -8,7 +8,7 @@
   method-b       候補トークンを最長名詞句(NP)へ展開して候補フレーズを得る。
                  旧 04_method_b_phrase.py 相当。
   cooccurrence   Method A → Method B を順に適用して対象表現を特定し、
-                 Nemotron-Personas-USA の「レコード単位」で共起セットを集計する。
+                 Nemotron-Personas-USA の「テキスト(フィールド)単位」で共起セットを集計する。
                  旧 05_record_cooccurrence.py 相当。
   benchmark      先頭 N 件(既定1万)で試走し、目標件数(既定100万)の所要時間・
                  延べ/ユニーク phrase 数・共起セット数を外挿推定する(出力は書かない)。
@@ -24,8 +24,8 @@
   data/03_method_a_stats.csv          Method A 全統計(α≤0.10)
   data/03_method_a_candidates.csv     Method A 候補トークン(+ alpha_tier 列)
   data/04_method_b_candidates.csv     Method B 候補フレーズ(+ alpha_tier/source_tokens 列)
-  data/05_record_matched_terms.jsonl  レコード別の対象表現明細
-  data/05_record_set_probabilities.csv 共起セットの出現確率(+ tiers_json/n_tier_* 列)
+  data/05_text_matched_terms.jsonl    テキスト別の対象表現明細(row_index/uuid/field 付き)
+  data/05_text_set_probabilities.csv  共起セットの出現確率(text_count + tiers_json/n_tier_* 列)
 
 alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0.01"/"0.05"/"0.10")。
 フレーズ/共起の tier は「そのフレーズに含まれる候補トークンの最も厳しい tier」。
@@ -75,9 +75,9 @@ LABELED_CLAUSES_PATH: Path = DATA_DIR / "02_labeled_clauses.csv"
 A_STATS_PATH: Path        = DATA_DIR / "03_method_a_stats.csv"
 A_CANDIDATES_PATH: Path   = DATA_DIR / "03_method_a_candidates.csv"
 B_CANDIDATES_PATH: Path   = DATA_DIR / "04_method_b_candidates.csv"
-COOC_TEXT_OUTPUT: Path    = DATA_DIR / "05_record_matched_terms.jsonl"
-COOC_TERM_OUTPUT: Path    = DATA_DIR / "05_record_set_probabilities.csv"
-COOC_SQLITE_PATH: Path    = DATA_DIR / "05_record_sets.sqlite3"
+COOC_TEXT_OUTPUT: Path    = DATA_DIR / "05_text_matched_terms.jsonl"
+COOC_TERM_OUTPUT: Path    = DATA_DIR / "05_text_set_probabilities.csv"
+COOC_SQLITE_PATH: Path    = DATA_DIR / "05_text_sets.sqlite3"
 
 # Method A: 統計キャッシュを作る最も緩い閾値
 MAX_ALPHA: float = 0.10
@@ -615,7 +615,7 @@ def cmd_method_b(args: argparse.Namespace) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# レコード内共起集計(Method A → Method B をレコード本文へオンライン適用)
+# テキスト内共起集計(Method A → Method B を各テキストフィールドへオンライン適用)
 # ════════════════════════════════════════════════════════════════════════════
 
 _WORKER_PARSER = None
@@ -634,41 +634,46 @@ def _init_worker(candidate_tokens: list[str], drop_single_word: bool) -> None:
     _WORKER_DROP_SINGLE_WORD = drop_single_word
 
 
-def extract_record_terms(texts: list[str]) -> list[str]:
-    """レコードの全テキストへ Method A → Method B を順に適用し、表現集合を返す。
+def extract_text_terms(text: str) -> list[str]:
+    """1テキスト(=1フィールド値)へ Method A → Method B を順に適用し、表現集合を返す。
 
     Method A : 候補トークン(_WORKER_TOKENS)が本文に出現するか判定。
     Method B : 出現した各トークンを、それを含む最長 NP に展開
                (該当 NP が無ければトークン自身を採用 = 04 main と同じ挙動)。
     """
+    if not text:
+        return []
     phrases: set[str] = set()
-    for text in texts:
-        if not text:
+    nps = extract_nps(text, _WORKER_PARSER)
+    text_lower = text.lower()
+    matched_tokens = [t for t in _WORKER_TOKENS if t in text_lower]
+    for token in matched_tokens:
+        result = find_longest_np_containing(token, nps)
+        phrase = token if result is None else result[0]
+        if _WORKER_DROP_SINGLE_WORD and len(phrase.split()) < 2:
             continue
-        nps = extract_nps(text, _WORKER_PARSER)
-        text_lower = text.lower()
-        matched_tokens = [t for t in _WORKER_TOKENS if t in text_lower]
-        for token in matched_tokens:
-            result = find_longest_np_containing(token, nps)
-            phrase = token if result is None else result[0]
-            if _WORKER_DROP_SINGLE_WORD and len(phrase.split()) < 2:
-                continue
-            phrases.add(phrase)
+        phrases.add(phrase)
     return sorted(phrases)
 
 
-def _process_row_task(task: dict) -> dict:
-    texts = [item["text"] for item in task["texts"]]
-    return {
-        "row_index": task["row_index"],
-        "uuid": task["uuid"],
-        "matched_terms": extract_record_terms(texts),
-    }
+def _process_row_task(task: dict) -> list[dict]:
+    """1レコードを処理し、テキスト(フィールド)単位の共起セットを複数返す。"""
+    out: list[dict] = []
+    for item in task["texts"]:
+        out.append({
+            "row_index": task["row_index"],
+            "uuid": task["uuid"],
+            "field": item["field"],
+            "matched_terms": extract_text_terms(item["text"]),
+        })
+    return out
 
 
 def _process_row_batch_task(tasks: list[dict]) -> tuple[list[dict], int]:
-    out = [_process_row_task(task) for task in tasks]
-    return out, len(tasks)
+    out: list[dict] = []
+    for task in tasks:
+        out.extend(_process_row_task(task))
+    return out, len(tasks)  # 第2要素は処理した「レコード数」(進捗・件数換算用)
 
 
 def normalize_to_text_list(value) -> list[str]:
@@ -769,7 +774,7 @@ def flush_set_buffer(conn: sqlite3.Connection, buf: list[tuple[str]]) -> None:
 
 def export_set_probabilities(
     conn: sqlite3.Connection,
-    total_records: int,
+    total_texts: int,
     output_path: Path,
     token_tier: Optional[dict[str, str]] = None,
 ) -> int:
@@ -777,13 +782,13 @@ def export_set_probabilities(
     conn.execute(
         """
         CREATE TABLE set_counts AS
-        SELECT term_set_key, COUNT(*) AS record_count
+        SELECT term_set_key, COUNT(*) AS text_count
         FROM raw_sets
         GROUP BY term_set_key
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_set_counts_count ON set_counts(record_count DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_set_counts_count ON set_counts(text_count DESC);"
     )
     conn.commit()
 
@@ -794,12 +799,12 @@ def export_set_probabilities(
     with output_path.open("w", encoding="utf-8", newline="") as fw:
         writer = csv.writer(fw)
         writer.writerow([
-            "terms_json", "tiers_json", "set_size", "record_count", "probability",
+            "terms_json", "tiers_json", "set_size", "text_count", "probability",
             "n_tier_001", "n_tier_005", "n_tier_010",
         ])
         for term_set_key, cnt in conn.execute(
-            "SELECT term_set_key, record_count FROM set_counts "
-            "ORDER BY record_count DESC, term_set_key ASC"
+            "SELECT term_set_key, text_count FROM set_counts "
+            "ORDER BY text_count DESC, term_set_key ASC"
         ):
             try:
                 terms = json.loads(term_set_key)
@@ -810,7 +815,7 @@ def export_set_probabilities(
             n001 = sum(1 for t in tiers if t == "0.01")
             n005 = sum(1 for t in tiers if t == "0.05")
             n010 = sum(1 for t in tiers if t == "0.10")
-            p = (cnt / total_records) if total_records > 0 else 0.0
+            p = (cnt / total_texts) if total_texts > 0 else 0.0
             writer.writerow([
                 term_set_key, tiers_json, len(terms), cnt, p, n001, n005, n010,
             ])
@@ -834,7 +839,7 @@ def run_cooccurrence(
     conn = setup_sqlite(args.sqlite_path)
     set_insert_buffer: list[tuple[str]] = []
     inserted_set_rows = 0
-    total_records = 0
+    total_texts = 0
     sampled_rows = 0
     started = time.time()
 
@@ -865,7 +870,7 @@ def run_cooccurrence(
                 for rec in row_result:
                     terms = rec["matched_terms"]
                     fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    total_records += 1
+                    total_texts += 1
                     unique_sorted = sorted(set(terms))
                     term_set_key = json.dumps(unique_sorted, ensure_ascii=False)
                     set_insert_buffer.append((term_set_key,))
@@ -878,7 +883,7 @@ def run_cooccurrence(
                     rps = sampled_rows / elapsed
                     print(
                         f"[progress] sampled_rows={sampled_rows} "
-                        f"total_records={total_records} "
+                        f"total_texts={total_texts} "
                         f"inserted_sets={inserted_set_rows + len(set_insert_buffer)} "
                         f"speed={rps:.2f} rows/s"
                     )
@@ -886,7 +891,7 @@ def run_cooccurrence(
     inserted_set_rows += len(set_insert_buffer)
     flush_set_buffer(conn, set_insert_buffer)
     set_types = export_set_probabilities(
-        conn, total_records=total_records, output_path=args.term_output,
+        conn, total_texts=total_texts, output_path=args.term_output,
         token_tier=token_tier,
     )
     conn.close()
@@ -895,7 +900,7 @@ def run_cooccurrence(
     print(f"candidate_tokens={len(candidate_tokens)}")
     print(f"workers={workers}")
     print(f"sampled_rows={sampled_rows}")
-    print(f"total_records={total_records}")
+    print(f"total_texts={total_texts}")
     print(f"set_rows_inserted={inserted_set_rows}")
     print(f"set_types={set_types}")
     print(f"elapsed_sec={elapsed:.2f}")
@@ -971,10 +976,11 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
     seen_phrases: set[str] = set()
     seen_sets: set[str] = set()
     total_occ = 0
-    processed = 0
-    phrase_snaps: list[tuple[int, int]] = []
-    set_snaps: list[tuple[int, int]] = []
-    t_first: Optional[float] = None  # 初回レコード到着まで(DL+spawn のウォームアップ)
+    rows = 0            # 処理済みレコード数(=データセット行数)
+    texts = 0           # 処理済みテキスト数(=共起セット数)
+    phrase_snaps: list[tuple[int, int]] = []  # (rows, unique phrases)
+    set_snaps: list[tuple[int, int]] = []     # (rows, unique text-level sets)
+    t_first: Optional[float] = None  # 初回バッチ到着まで(DL+spawn のウォームアップ)
 
     print(f"[benchmark] test_rows={test_rows} workers={workers} dataset={args.dataset}")
     started = time.time()
@@ -983,68 +989,74 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
         workers, initializer=_init_worker,
         initargs=(sorted(candidate_tokens), args.drop_single_word),
     ) as pool:
-        for row_result, _ in pool.imap_unordered(
+        for row_result, rows_done in pool.imap_unordered(
             _process_row_batch_task, batches, chunksize=max(1, args.pool_chunksize)
         ):
             if t_first is None:
                 t_first = time.time() - started
-            for rec in row_result:
-                processed += 1
+            for rec in row_result:               # rec はテキスト(フィールド)単位
+                texts += 1
                 terms = rec["matched_terms"]
                 total_occ += len(terms)
                 seen_phrases.update(terms)
                 seen_sets.add(json.dumps(sorted(set(terms)), ensure_ascii=False))
-                if pending and processed >= pending[0]:
+            rows += rows_done
+            if pending and rows >= pending[0]:    # レコード数でチェックポイント
+                while pending and rows >= pending[0]:
                     pending.pop(0)
-                    phrase_snaps.append((processed, len(seen_phrases)))
-                    set_snaps.append((processed, len(seen_sets)))
+                phrase_snaps.append((rows, len(seen_phrases)))
+                set_snaps.append((rows, len(seen_sets)))
     elapsed = time.time() - started
 
-    if processed == 0:
-        print("[benchmark] 処理レコードが0件でした。dataset/split/フィールド設定を確認してください。")
+    if rows == 0 or texts == 0:
+        print("[benchmark] 処理レコード/テキストが0件でした。dataset/split/フィールド設定を確認してください。")
         return
 
-    if not phrase_snaps or phrase_snaps[-1][0] != processed:
-        phrase_snaps.append((processed, len(seen_phrases)))
-        set_snaps.append((processed, len(seen_sets)))
+    if not phrase_snaps or phrase_snaps[-1][0] != rows:
+        phrase_snaps.append((rows, len(seen_phrases)))
+        set_snaps.append((rows, len(seen_sets)))
 
-    rate = processed / elapsed if elapsed > 0 else float("inf")
-    avg_phrases = total_occ / processed
+    rate = rows / elapsed if elapsed > 0 else float("inf")
+    texts_per_row = texts / rows
+    avg_phrases_text = total_occ / texts
     est_time = target_rows / rate if rate > 0 else float("inf")
-    est_occ = avg_phrases * target_rows
+    est_texts = texts_per_row * target_rows
+    est_occ = (total_occ / rows) * target_rows
     est_uphr, beta_p = _heaps_estimate(phrase_snaps, target_rows)
     est_usets, beta_s = _heaps_estimate(set_snaps, target_rows)
-    lin_uphr = len(seen_phrases) / processed * target_rows
-    lin_usets = len(seen_sets) / processed * target_rows
+    lin_uphr = len(seen_phrases) / rows * target_rows
+    lin_usets = len(seen_sets) / rows * target_rows
 
     bp = f"Heaps β={beta_p:.3f}" if beta_p is not None else "線形"
     bs = f"Heaps β={beta_s:.3f}" if beta_s is not None else "線形"
 
     print("\n" + "=" * 64)
-    print(f"  ベンチマーク実測 ({processed:,} レコード)")
+    print(f"  ベンチマーク実測 ({rows:,} レコード / {texts:,} テキスト)")
     print("=" * 64)
     warm = t_first if t_first is not None else 0.0
-    print(f"  処理時間             : {_fmt_duration(elapsed)} ({elapsed:.1f}s)")
-    print(f"   うちウォームアップ  : {warm:.1f}s (初回DL+spawn)")
-    print(f"  全体スループット     : {rate:.1f} レコード/秒")
-    print(f"  平均 phrase / レコード: {avg_phrases:.2f}")
-    print(f"  ユニーク phrase      : {len(seen_phrases):,}")
-    print(f"  ユニーク 共起セット  : {len(seen_sets):,}")
-    print(f"  延べ phrase 出現     : {total_occ:,}")
+    print(f"  処理時間              : {_fmt_duration(elapsed)} ({elapsed:.1f}s)")
+    print(f"   うちウォームアップ   : {warm:.1f}s (初回DL+spawn)")
+    print(f"  全体スループット      : {rate:.1f} レコード/秒")
+    print(f"  テキスト数 / レコード : {texts_per_row:.2f}")
+    print(f"  平均 phrase / テキスト: {avg_phrases_text:.2f}")
+    print(f"  ユニーク phrase       : {len(seen_phrases):,}")
+    print(f"  ユニーク 共起セット   : {len(seen_sets):,} (テキスト単位)")
+    print(f"  延べ phrase 出現      : {total_occ:,}")
     print("\n" + "-" * 64)
     print(f"  {target_rows:,} レコードへの外挿")
     print("-" * 64)
-    print(f"  推定処理時間         : {_fmt_duration(est_time)}  (@{rate:.0f} rec/s, 線形)")
-    print(f"  延べ phrase 出現     : 約 {est_occ:,.0f}  (線形)")
-    print(f"  ユニーク phrase      : 約 {est_uphr:,.0f}  ({bp})")
-    print(f"     参考: 線形外挿     : 約 {lin_uphr:,.0f}")
-    print(f"  ユニーク 共起セット  : 約 {est_usets:,.0f}  ({bs})")
-    print(f"     参考: 線形外挿     : 約 {lin_usets:,.0f}")
+    print(f"  推定処理時間          : {_fmt_duration(est_time)}  (@{rate:.0f} rec/s, 線形)")
+    print(f"  延べテキスト(=セット) : 約 {est_texts:,.0f}")
+    print(f"  延べ phrase 出現      : 約 {est_occ:,.0f}  (線形)")
+    print(f"  ユニーク phrase       : 約 {est_uphr:,.0f}  ({bp})")
+    print(f"     参考: 線形外挿      : 約 {lin_uphr:,.0f}")
+    print(f"  ユニーク 共起セット   : 約 {est_usets:,.0f}  ({bs})")
+    print(f"     参考: 線形外挿      : 約 {lin_usets:,.0f}")
     print("=" * 64)
-    print("注: ユニーク数は語彙成長(Heaps則)で逓減するため Heaps 推定が主、線形は上限目安。")
+    print("注: 共起セットはテキスト(フィールド)単位。ユニーク数は語彙成長(Heaps則)で")
+    print("    逓減するため Heaps 推定が主、線形は上限目安。")
     print("    時間推定はウォームアップ(初回DL+spawn)を含む全体スループットの線形外挿。")
-    print("    上の『ウォームアップ』が処理時間の大半を占める場合は test-rows が小さすぎる")
-    print("    サイン。実運用機で test-rows を大きめ(数万〜)にすると精度が上がる。")
+    print("    『ウォームアップ』が処理時間の大半を占める場合は test-rows が小さすぎるサイン。")
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
@@ -1144,7 +1156,7 @@ def parse_args() -> argparse.Namespace:
     pb.set_defaults(func=cmd_method_b)
 
     # cooccurrence
-    pc = sub.add_parser("cooccurrence", help="レコード単位で共起セットを集計する")
+    pc = sub.add_parser("cooccurrence", help="テキスト(フィールド)単位で共起セットを集計する")
     _add_cooccurrence_args(pc, with_candidates_csv=True)
     pc.set_defaults(func=cmd_cooccurrence)
 

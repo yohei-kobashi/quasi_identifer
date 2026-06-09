@@ -10,6 +10,8 @@
   cooccurrence   Method A → Method B を順に適用して対象表現を特定し、
                  Nemotron-Personas-USA の「レコード単位」で共起セットを集計する。
                  旧 05_record_cooccurrence.py 相当。
+  benchmark      先頭 N 件(既定1万)で試走し、目標件数(既定100万)の所要時間・
+                 延べ/ユニーク phrase 数・共起セット数を外挿推定する(出力は書かない)。
   all            method-a → method-b → cooccurrence を一気通貫で実行する。
                  候補トークンはメモリ上で受け渡すため CSV 経由のやり取りは不要。
 
@@ -37,6 +39,7 @@ alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0
   python qpii_pipeline.py method-a --compare       # α=0.01/0.05/0.10 比較
   python qpii_pipeline.py method-b                 # 候補フレーズ
   python qpii_pipeline.py cooccurrence --sample-ratio 0.01
+  python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
   python qpii_pipeline.py all --sample-ratio 0.01  # 全ステージ
 """
 
@@ -912,6 +915,147 @@ def cmd_cooccurrence(args: argparse.Namespace) -> None:
     run_cooccurrence(args, candidate_tokens, token_tier)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ベンチマーク / 推定モード
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.1f} 秒"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} 分"
+    return f"{seconds / 3600:.2f} 時間"
+
+
+def _heaps_estimate(
+    points: list[tuple[int, int]], target: int
+) -> tuple[float, Optional[float]]:
+    """points=[(n, value), ...] を Heaps 則 value=K*n^β で最小二乗フィットし、
+
+    target における推定値と β を返す。有効点が2未満なら線形外挿(β=None)。
+    """
+    import numpy as np
+
+    pts = [(n, v) for n, v in points if n > 0 and v > 0]
+    if len(pts) < 2:
+        n, v = points[-1]
+        return (v / n * target if n else 0.0), None
+    ns = np.array([p[0] for p in pts], dtype=float)
+    vs = np.array([p[1] for p in pts], dtype=float)
+    beta, log_k = np.polyfit(np.log(ns), np.log(vs), 1)
+    return float(np.exp(log_k)) * (target ** beta), float(beta)
+
+
+def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
+    if not candidate_tokens:
+        raise RuntimeError("候補トークンが0件です。先に method-a を実行してください。")
+    download_nltk_data()
+    workers = resolve_workers(args.workers)
+    test_rows = max(1, args.test_rows)
+    target_rows = max(1, args.target_rows)
+    requested_fields = list(TEXT_FIELDS)
+
+    # Heaps 則フィット用のチェックポイント
+    fracs = (0.1, 0.25, 0.5, 0.75, 1.0)
+    pending = sorted({max(1, int(test_rows * f)) for f in fracs})
+
+    row_tasks = iter_sampled_row_tasks(
+        dataset_name=args.dataset, split=args.split,
+        streaming=not args.no_streaming,
+        sample_ratio=1.0,          # 先頭から連続 test_rows 件を処理
+        seed=args.seed, max_rows=test_rows,
+        requested_fields=requested_fields,
+    )
+    batches = iter_row_task_batches(row_tasks, batch_size=max(1, args.row_batch_size))
+
+    seen_phrases: set[str] = set()
+    seen_sets: set[str] = set()
+    total_occ = 0
+    processed = 0
+    phrase_snaps: list[tuple[int, int]] = []
+    set_snaps: list[tuple[int, int]] = []
+    t_first: Optional[float] = None  # 初回レコード到着まで(DL+spawn のウォームアップ)
+
+    print(f"[benchmark] test_rows={test_rows} workers={workers} dataset={args.dataset}")
+    started = time.time()
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(
+        workers, initializer=_init_worker,
+        initargs=(sorted(candidate_tokens), args.drop_single_word),
+    ) as pool:
+        for row_result, _ in pool.imap_unordered(
+            _process_row_batch_task, batches, chunksize=max(1, args.pool_chunksize)
+        ):
+            if t_first is None:
+                t_first = time.time() - started
+            for rec in row_result:
+                processed += 1
+                terms = rec["matched_terms"]
+                total_occ += len(terms)
+                seen_phrases.update(terms)
+                seen_sets.add(json.dumps(sorted(set(terms)), ensure_ascii=False))
+                if pending and processed >= pending[0]:
+                    pending.pop(0)
+                    phrase_snaps.append((processed, len(seen_phrases)))
+                    set_snaps.append((processed, len(seen_sets)))
+    elapsed = time.time() - started
+
+    if processed == 0:
+        print("[benchmark] 処理レコードが0件でした。dataset/split/フィールド設定を確認してください。")
+        return
+
+    if not phrase_snaps or phrase_snaps[-1][0] != processed:
+        phrase_snaps.append((processed, len(seen_phrases)))
+        set_snaps.append((processed, len(seen_sets)))
+
+    rate = processed / elapsed if elapsed > 0 else float("inf")
+    avg_phrases = total_occ / processed
+    est_time = target_rows / rate if rate > 0 else float("inf")
+    est_occ = avg_phrases * target_rows
+    est_uphr, beta_p = _heaps_estimate(phrase_snaps, target_rows)
+    est_usets, beta_s = _heaps_estimate(set_snaps, target_rows)
+    lin_uphr = len(seen_phrases) / processed * target_rows
+    lin_usets = len(seen_sets) / processed * target_rows
+
+    bp = f"Heaps β={beta_p:.3f}" if beta_p is not None else "線形"
+    bs = f"Heaps β={beta_s:.3f}" if beta_s is not None else "線形"
+
+    print("\n" + "=" * 64)
+    print(f"  ベンチマーク実測 ({processed:,} レコード)")
+    print("=" * 64)
+    warm = t_first if t_first is not None else 0.0
+    print(f"  処理時間             : {_fmt_duration(elapsed)} ({elapsed:.1f}s)")
+    print(f"   うちウォームアップ  : {warm:.1f}s (初回DL+spawn)")
+    print(f"  全体スループット     : {rate:.1f} レコード/秒")
+    print(f"  平均 phrase / レコード: {avg_phrases:.2f}")
+    print(f"  ユニーク phrase      : {len(seen_phrases):,}")
+    print(f"  ユニーク 共起セット  : {len(seen_sets):,}")
+    print(f"  延べ phrase 出現     : {total_occ:,}")
+    print("\n" + "-" * 64)
+    print(f"  {target_rows:,} レコードへの外挿")
+    print("-" * 64)
+    print(f"  推定処理時間         : {_fmt_duration(est_time)}  (@{rate:.0f} rec/s, 線形)")
+    print(f"  延べ phrase 出現     : 約 {est_occ:,.0f}  (線形)")
+    print(f"  ユニーク phrase      : 約 {est_uphr:,.0f}  ({bp})")
+    print(f"     参考: 線形外挿     : 約 {lin_uphr:,.0f}")
+    print(f"  ユニーク 共起セット  : 約 {est_usets:,.0f}  ({bs})")
+    print(f"     参考: 線形外挿     : 約 {lin_usets:,.0f}")
+    print("=" * 64)
+    print("注: ユニーク数は語彙成長(Heaps則)で逓減するため Heaps 推定が主、線形は上限目安。")
+    print("    時間推定はウォームアップ(初回DL+spawn)を含む全体スループットの線形外挿。")
+    print("    上の『ウォームアップ』が処理時間の大半を占める場合は test-rows が小さすぎる")
+    print("    サイン。実運用機で test-rows を大きめ(数万〜)にすると精度が上がる。")
+
+
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    candidate_tokens, _ = load_candidates_with_tier(
+        args.candidates_csv,
+        min_freq_profile=args.min_freq_profile,
+        min_effect_size=args.min_effect_size,
+    )
+    run_benchmark(args, candidate_tokens)
+
+
 # ── サブコマンド: all(全ステージを一気通貫) ─────────────────────────────────
 
 def cmd_all(args: argparse.Namespace) -> None:
@@ -1003,6 +1147,16 @@ def parse_args() -> argparse.Namespace:
     pc = sub.add_parser("cooccurrence", help="レコード単位で共起セットを集計する")
     _add_cooccurrence_args(pc, with_candidates_csv=True)
     pc.set_defaults(func=cmd_cooccurrence)
+
+    # benchmark
+    pbm = sub.add_parser(
+        "benchmark", help="N件で試走し、目標件数の所要時間/phrase数を推定する")
+    pbm.add_argument("--test-rows", type=int, default=10000,
+                     help="試走するレコード数(先頭から連続)")
+    pbm.add_argument("--target-rows", type=int, default=1_000_000,
+                     help="外挿先のレコード数")
+    _add_cooccurrence_args(pbm, with_candidates_csv=True)
+    pbm.set_defaults(func=cmd_benchmark)
 
     # all
     pall = sub.add_parser("all", help="method-a → method-b → cooccurrence を一気通貫で実行")

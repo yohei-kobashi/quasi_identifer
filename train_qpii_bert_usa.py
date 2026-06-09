@@ -1,26 +1,29 @@
-"""Fine-tune (English) ModernBERT to classify clause → label on Nemotron-USA.
+"""Fine-tune DeBERTa-v3 to classify clause → label on Nemotron-USA (全データ学習)。
 
-`train_qpii_bert.py`(日本語・回帰版)を参考にした英語・分類版。
+`train_qpii_bert.py`(日本語・回帰版)を参考にした英語・分類版。本番モデル作成用に
+「全データ学習のみ」を行う(モデル比較・K分割CVは compare_models_usa.py 側で実施済み)。
 
-相違点
-------
+相違点 / 方針
+------------
 * タスク: 回帰(確率スコア) → **3クラス分類**(PII / PROFILE / NONE)。
-* データ: 共起CSVから targets を組み立てる方式 → `annotations_usa2.jsonl` の
-  各行 (`clause`, `label`) を直接学習データに使う。
-* モデル: `sbintuitions/modernbert-ja-310m`(日本語) → 英語 ModernBERT。
-  既定 `answerdotai/ModernBERT-base`(約150M)。`answerdotai/ModernBERT-large`
-  (約395M, JA 310m に近い規模)も選択可。
-* ラベル不均衡(PROFILE が約73%)に対応するため、層化K分割CVと
-  クラス重み付き損失(balanced)を既定で使用。
+* データ: `annotations_usa2.jsonl` の各行 (`clause`, `label`) を直接学習データに使う。
+* モデル: 比較(compare_models_usa.py)で最良だった **`microsoft/deberta-v3-large`** を既定。
+  他モデルも `--model-name` で指定可(ModernBERT を選ぶと自動で reference_compile=False)。
+* ラベル不均衡(PROFILE が約73%)対策として、クラス重み付き損失(balanced)を既定で使用。
+* **K分割CVは本スクリプトから除外**。精度評価/モデル比較は compare_models_usa.py を使う。
+  本スクリプトは全データで1モデルを学習して保存する(ホールドアウト評価は行わない)。
 
-要件: transformers >= 4.48.0 (ModernBERT ネイティブ対応), scikit-learn, torch。
+注意: ヘルパー関数(build_model / WeightedTrainer / make_compute_metrics 等)は
+compare_models_usa.py から import 再利用されるため、定義はここに残してある。
+
+要件: transformers >= 4.48.0, scikit-learn, torch, sentencepiece(DeBERTa-v3 用)。
 
 使い方
 ------
-  python train_qpii_bert_usa.py                         # 既定: base, 5-fold CV + 最終モデル
+  python train_qpii_bert_usa.py                          # 既定: deberta-v3-large 全データ学習
   python train_qpii_bert_usa.py --model-name answerdotai/ModernBERT-large
-  python train_qpii_bert_usa.py --skip-cv               # CV を飛ばして全データ学習のみ
-  python train_qpii_bert_usa.py --class-weights none    # クラス重みを使わない
+  python train_qpii_bert_usa.py --class-weights none     # クラス重みを使わない
+  python train_qpii_bert_usa.py --hub-repo user/qpii-deberta  # Hub へアップロード
 """
 
 import argparse
@@ -39,7 +42,6 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
-    EarlyStoppingCallback,
     Trainer,
     TrainerCallback,
     TrainingArguments,
@@ -53,7 +55,6 @@ except ImportError:  # python-dotenv は任意
         return False
 
 from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
-from sklearn.model_selection import StratifiedKFold
 
 
 # ── データ読み込み ────────────────────────────────────────────────────────────
@@ -207,27 +208,22 @@ def main() -> None:
     load_dotenv(dotenv_path=".env", override=False)
 
     parser = argparse.ArgumentParser(
-        description="Fine-tune English ModernBERT for clause→label (PII/PROFILE/NONE) classification."
+        description="Fine-tune DeBERTa-v3 for clause→label (PII/PROFILE/NONE) classification on FULL data."
     )
     parser.add_argument("--data-path", default="annotations_usa2.jsonl")
-    parser.add_argument("--model-name", default="answerdotai/ModernBERT-base",
-                        help="英語 ModernBERT。大きめは answerdotai/ModernBERT-large")
-    parser.add_argument("--train-batch-size", type=int, default=32)
-    parser.add_argument("--eval-batch-size", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
-    parser.add_argument("--epochs", type=float, default=4.0)
+    parser.add_argument("--model-name", default="microsoft/deberta-v3-large",
+                        help="比較(compare_models_usa.py)で最良だった DeBERTa-v3-large。他モデルも指定可")
+    parser.add_argument("--train-batch-size", type=int, default=16)
+    parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
-    parser.add_argument("--num-folds", type=int, default=5)
-    parser.add_argument("--skip-cv", action="store_true")
-    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--max-length", type=int, default=256,
-                        help="clause は短いので256で十分(ModernBERT は最大8192)")
+                        help="clause は短いので256で十分(DeBERTa-v3 は最大512)")
     parser.add_argument("--class-weights", choices=["balanced", "none"], default="balanced",
                         help="ラベル不均衡対策。balanced=逆頻度重み, none=重みなし")
-    parser.add_argument("--early-stopping-patience", type=int, default=0,
-                        help="0で無効。>0 で macro_f1 が改善しないエポック数で早期終了")
-    parser.add_argument("--output-dir", default="./outputs/qpii_modernbert_usa")
+    parser.add_argument("--output-dir", default="./outputs/qpii_deberta_usa")
     parser.add_argument("--hub-repo", default=os.environ.get("HF_OUTPUT_REPO"))
     parser.add_argument("--hub-private", action="store_true")
     parser.add_argument("--hub-token", default=os.environ.get("HF_TOKEN"))
@@ -237,8 +233,8 @@ def main() -> None:
     random.seed(args.seed)
     set_seed(args.seed)
 
-    # ── [1/5] データ読み込み + ラベル符号化 ────────────────────────────────
-    print("[1/5] Loading data ...")
+    # ── [1/4] データ読み込み + ラベル符号化 ────────────────────────────────
+    print("[1/4] Loading data ...")
     clauses, label_strs = load_clause_label(args.data_path)
     if not clauses:
         raise RuntimeError(f"No usable (clause,label) rows in {args.data_path}")
@@ -249,12 +245,11 @@ def main() -> None:
     num_labels = len(label_names)
     y = [label2id[s] for s in label_strs]
 
-    dist = Counter(label_strs)
     print(f"  samples={len(clauses)}  labels={label_names}")
-    print(f"  distribution={dict(dist)}")
+    print(f"  distribution={dict(Counter(label_strs))}")
 
-    # ── [2/5] トークナイズ ────────────────────────────────────────────────
-    print("[2/5] Loading tokenizer and tokenizing ...")
+    # ── [2/4] トークナイズ ────────────────────────────────────────────────
+    print("[2/4] Loading tokenizer and tokenizing ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     raw_ds = Dataset.from_dict({"text": clauses, "labels": y})
 
@@ -265,97 +260,31 @@ def main() -> None:
     tokenized_ds = tokenized_ds.remove_columns(["text"])
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, pad_to_multiple_of=8)
-    compute_metrics = make_compute_metrics(label_names)
     ta_sig = inspect.signature(TrainingArguments.__init__).parameters
     trainer_sig = inspect.signature(Trainer.__init__).parameters
 
-    def make_weights(label_ids: List[int]) -> Optional[torch.Tensor]:
-        if args.class_weights == "none":
-            return None
-        return compute_class_weights(label_ids, num_labels)
+    class_weights: Optional[torch.Tensor] = None
+    if args.class_weights == "balanced":
+        class_weights = compute_class_weights(y, num_labels)
 
-    def fold_callbacks(fold: int) -> List[TrainerCallback]:
-        cbs: List[TrainerCallback] = [StepMetricsPrinterCallback(fold=fold)]
-        if args.early_stopping_patience > 0:
-            cbs.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
-        return cbs
-
-    common_ta: Dict[str, Any] = {
+    # ── [3/4] 全データで学習 ──────────────────────────────────────────────
+    # K分割CVによる評価は compare_models_usa.py 側で実施する。ここは全データ学習のみ。
+    print("[3/4] Training on full data ...")
+    final_dir = os.path.join(args.output_dir, "final_full_data")
+    set_seed(args.seed)
+    model = build_model(args.model_name, num_labels, id2label, label2id)
+    steps_per_epoch = max(1, len(tokenized_ds) // max(1, args.train_batch_size * args.grad_accum))
+    warmup_steps = int(steps_per_epoch * args.epochs * args.warmup_ratio)
+    ta_kwargs: Dict[str, Any] = {
+        "output_dir": final_dir,
         "num_train_epochs": args.epochs,
         "learning_rate": args.learning_rate,
         "per_device_train_batch_size": args.train_batch_size,
-        "per_device_eval_batch_size": args.eval_batch_size,
         "gradient_accumulation_steps": args.grad_accum,
         "weight_decay": args.weight_decay,
+        "warmup_steps": warmup_steps,
         "bf16": torch.cuda.is_available(),
         "report_to": "none",
-    }
-
-    # ── [3/5] 層化K分割CV ──────────────────────────────────────────────────
-    all_metrics: List[Dict[str, float]] = []
-    if args.skip_cv:
-        print("[3/5] Skipping stratified K-fold CV (--skip-cv)")
-    else:
-        print(f"[3/5] {args.num_folds}-fold stratified CV ...")
-        skf = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
-        for fold_idx, (train_idx, eval_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
-            fold_seed = args.seed + fold_idx
-            set_seed(fold_seed)
-            train_ds = tokenized_ds.select(train_idx.tolist())
-            eval_ds = tokenized_ds.select(eval_idx.tolist())
-            run_dir = os.path.join(args.output_dir, f"fold_{fold_idx + 1}")
-            steps_per_epoch = max(1, len(train_ds) // max(1, args.train_batch_size * args.grad_accum))
-            warmup_steps = int(steps_per_epoch * args.epochs * args.warmup_ratio)
-
-            model = build_model(args.model_name, num_labels, id2label, label2id)
-            ta_kwargs = {
-                **common_ta,
-                "output_dir": run_dir,
-                "warmup_steps": warmup_steps,
-                "load_best_model_at_end": True,
-                "metric_for_best_model": "macro_f1",
-                "greater_is_better": True,
-                "push_to_hub": False,
-                "seed": fold_seed,
-            }
-            training_args = build_training_args(ta_sig, ta_kwargs, do_eval=True)
-
-            trainer_kwargs: Dict[str, Any] = {
-                "model": model,
-                "args": training_args,
-                "train_dataset": train_ds,
-                "eval_dataset": eval_ds,
-                "data_collator": data_collator,
-                "compute_metrics": compute_metrics,
-                "callbacks": fold_callbacks(fold_idx + 1),
-                "class_weights": make_weights([y[i] for i in train_idx]),
-            }
-            attach_tokenizer(trainer_sig, trainer_kwargs, tokenizer)
-            trainer = WeightedTrainer(**trainer_kwargs)
-            trainer.train()
-            metrics = trainer.evaluate()
-            print(f"[fold {fold_idx + 1}] eval: {metrics}")
-            all_metrics.append(metrics)
-
-        if all_metrics:
-            keys = ["eval_accuracy", "eval_macro_f1", "eval_weighted_f1"]
-            print("\n=== CV averages ===")
-            for k in keys:
-                vals = [m[k] for m in all_metrics if k in m]
-                if vals:
-                    print(f"  {k}: {sum(vals) / len(vals):.4f}")
-
-    # ── [4/5] 全データで最終モデルを学習 ──────────────────────────────────
-    print("[4/5] Training final model on full data ...")
-    final_dir = os.path.join(args.output_dir, "final_full_data")
-    set_seed(args.seed)
-    final_model = build_model(args.model_name, num_labels, id2label, label2id)
-    steps_per_epoch = max(1, len(tokenized_ds) // max(1, args.train_batch_size * args.grad_accum))
-    warmup_steps = int(steps_per_epoch * args.epochs * args.warmup_ratio)
-    final_ta_kwargs = {
-        **common_ta,
-        "output_dir": final_dir,
-        "warmup_steps": warmup_steps,
         "load_best_model_at_end": False,
         "push_to_hub": bool(args.hub_repo),
         "hub_model_id": args.hub_repo,
@@ -363,29 +292,29 @@ def main() -> None:
         "hub_token": args.hub_token,
         "seed": args.seed,
     }
-    final_training_args = build_training_args(ta_sig, final_ta_kwargs, do_eval=False)
-    final_trainer_kwargs: Dict[str, Any] = {
-        "model": final_model,
-        "args": final_training_args,
+    training_args = build_training_args(ta_sig, ta_kwargs, do_eval=False)
+    trainer_kwargs: Dict[str, Any] = {
+        "model": model,
+        "args": training_args,
         "train_dataset": tokenized_ds,
         "data_collator": data_collator,
         "callbacks": [StepMetricsPrinterCallback(fold=0)],
-        "class_weights": make_weights(y),
+        "class_weights": class_weights,
     }
-    attach_tokenizer(trainer_sig, final_trainer_kwargs, tokenizer)
-    final_trainer = WeightedTrainer(**final_trainer_kwargs)
-    final_trainer.train()
+    attach_tokenizer(trainer_sig, trainer_kwargs, tokenizer)
+    trainer = WeightedTrainer(**trainer_kwargs)
+    trainer.train()
 
-    # ── [5/5] 保存 / アップロード ──────────────────────────────────────────
-    print("[5/5] Saving ...")
+    # ── [4/4] 保存 / アップロード ──────────────────────────────────────────
+    print("[4/4] Saving ...")
     os.makedirs(final_dir, exist_ok=True)
-    final_trainer.save_model(final_dir)
+    trainer.save_model(final_dir)
     tokenizer.save_pretrained(final_dir)
     with open(os.path.join(final_dir, "label_mapping.json"), "w", encoding="utf-8") as f:
         json.dump({"label2id": label2id, "id2label": id2label}, f, ensure_ascii=False, indent=2)
 
     if args.hub_repo:
-        final_trainer.push_to_hub()
+        trainer.push_to_hub()
         print(f"Uploaded final model to {args.hub_repo}")
     else:
         print(f"Final model saved under {final_dir} "

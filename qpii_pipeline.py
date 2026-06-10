@@ -1245,13 +1245,21 @@ def run_benchmark(
     )
     batches = iter_row_task_batches(row_tasks, batch_size=max(1, args.row_batch_size))
 
+    emit_pairs = bool(args.pairs)
+    min_pair_count = max(1, args.min_pair_count)
+
     seen_phrases: set[str] = set()
     seen_sets: dict[str, set] = {u: set() for u in units}     # 単位ごとのユニークセット
     unit_counts: dict[str, int] = {u: 0 for u in units}        # 単位ごとの延べセット数
+    pair_counts: dict[str, Counter] = {u: Counter() for u in units}  # (a,b)->共起回数
+    pair_occ_total: dict[str, int] = {u: 0 for u in units}     # 延べペア出現(=ΣC(|s|,2))
     total_occ = 0
     rows = 0
     phrase_snaps: list[tuple[int, int]] = []
     set_snaps: dict[str, list[tuple[int, int]]] = {u: [] for u in units}
+    # ペアの Heaps 用スナップショット: ユニークペア数 / co_count>=K のペア数
+    pair_uniq_snaps: dict[str, list[tuple[int, int]]] = {u: [] for u in units}
+    pair_keep_snaps: dict[str, list[tuple[int, int]]] = {u: [] for u in units}
     t_first: Optional[float] = None
 
     print(f"[benchmark] test_rows={test_rows} workers={workers} units={units} input={args.input}")
@@ -1272,9 +1280,14 @@ def run_benchmark(
                     seen_phrases.update(terms)
                 sets = record_unit_sets(rec, units)
                 for u in units:
+                    pc = pair_counts[u]
                     for s in sets[u]:
                         unit_counts[u] += 1
                         seen_sets[u].add(json.dumps(s, ensure_ascii=False))
+                        if emit_pairs and len(s) >= 2:
+                            for a, b in combinations(s, 2):  # s はソート済み
+                                pc[(a, b)] += 1
+                                pair_occ_total[u] += 1
             rows += rows_done
             if pending and rows >= pending[0]:
                 while pending and rows >= pending[0]:
@@ -1282,6 +1295,11 @@ def run_benchmark(
                 phrase_snaps.append((rows, len(seen_phrases)))
                 for u in units:
                     set_snaps[u].append((rows, len(seen_sets[u])))
+                    if emit_pairs:
+                        pc = pair_counts[u]
+                        keep = sum(1 for c in pc.values() if c >= min_pair_count)
+                        pair_uniq_snaps[u].append((rows, len(pc)))
+                        pair_keep_snaps[u].append((rows, keep))
     elapsed = time.time() - started
 
     if rows == 0:
@@ -1292,6 +1310,11 @@ def run_benchmark(
         phrase_snaps.append((rows, len(seen_phrases)))
         for u in units:
             set_snaps[u].append((rows, len(seen_sets[u])))
+            if emit_pairs:
+                pc = pair_counts[u]
+                keep = sum(1 for c in pc.values() if c >= min_pair_count)
+                pair_uniq_snaps[u].append((rows, len(pc)))
+                pair_keep_snaps[u].append((rows, keep))
 
     rate = rows / elapsed if elapsed > 0 else float("inf")
     est_time = target_rows / rate if rate > 0 else float("inf")
@@ -1312,6 +1335,12 @@ def run_benchmark(
     for u in units:
         print(f"    {u:6s}: {unit_counts[u]:,} / {len(seen_sets[u]):,}  "
               f"({unit_counts[u] / rows:.2f} セット/レコード)")
+    if emit_pairs:
+        print(f"  単位別 ペア数(延べ / ユニーク / co_count≥{min_pair_count}):")
+        for u in units:
+            pc = pair_counts[u]
+            keep = sum(1 for c in pc.values() if c >= min_pair_count)
+            print(f"    {u:6s}: {pair_occ_total[u]:,} / {len(pc):,} / {keep:,}")
     print("\n" + "-" * 64)
     print(f"  {target_rows:,} レコードへの外挿")
     print("-" * 64)
@@ -1324,9 +1353,25 @@ def run_benchmark(
         est_total = (unit_counts[u] / rows) * target_rows
         print(f"  [{u:6s}] 延べセット 約 {est_total:,.0f} / "
               f"ユニーク 約 {est_sets:,.0f} ({bu})")
+    if emit_pairs:
+        print("-" * 64)
+        print(f"  ペア共起の外挿 (出力CSV行数 = co_count≥{min_pair_count} のユニークペア)")
+        print("-" * 64)
+        for u in units:
+            est_pocc = (pair_occ_total[u] / rows) * target_rows
+            est_puniq, beta_pu = _heaps_estimate(pair_uniq_snaps[u], target_rows)
+            est_pkeep, beta_pk = _heaps_estimate(pair_keep_snaps[u], target_rows)
+            bpu = f"Heaps β={beta_pu:.3f}" if beta_pu is not None else "線形"
+            bpk = f"Heaps β={beta_pk:.3f}" if beta_pk is not None else "線形"
+            print(f"  [{u:6s}] 延べペア 約 {est_pocc:,.0f} (線形) / "
+                  f"ユニーク 約 {est_puniq:,.0f} ({bpu})")
+            print(f"           └ CSV行数(co_count≥{min_pair_count}) 約 {est_pkeep:,.0f} ({bpk})")
     print("=" * 64)
     print("注: ユニーク数は語彙成長(Heaps則)で逓減するため Heaps 推定が主。")
     print("    時間推定はウォームアップ(初回DL+spawn)を含む全体スループットの線形外挿。")
+    if emit_pairs:
+        print("    ペアCSV行数は co_count≥K のユニークペア数。閾値超えは n とともに増えるため")
+        print("    Heaps外挿(逓増/逓減)。--no-pairs でペア集計を省略可。")
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:

@@ -27,7 +27,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 from tqdm.auto import tqdm

@@ -7,9 +7,9 @@
                  旧 03_method_a_extract.py 相当。
   method-b       候補トークンを最長名詞句(NP)へ展開して候補フレーズを得る。
                  旧 04_method_b_phrase.py 相当。
-  cooccurrence   Method A → Method B を順に適用して対象表現を特定し、
-                 Nemotron-Personas-USA の「テキスト(フィールド)単位」で共起セットを集計する。
-                 旧 05_record_cooccurrence.py 相当。
+  cooccurrence   Method A → Method B を順に適用して対象表現を特定し、annotations_pred_usa.jsonl
+                 (予測アノテーション)の「テキスト(フィールド)単位」で共起セットを集計する。
+                 同一(record, field)の clause をまとめて1テキストとして扱う。旧 05 相当。
   benchmark      先頭 N 件(既定1万)で試走し、目標件数(既定100万)の所要時間・
                  延べ/ユニーク phrase 数・共起セット数を外挿推定する(出力は書かない)。
   all            method-a → method-b → cooccurrence を一気通貫で実行する。
@@ -17,15 +17,19 @@
 
 入力
 ----
-  data/02_labeled_clauses.csv   (label ∈ {PROFILE, NONE}, clause)
+  annotations_pred_usa.jsonl    (annotate_with_deberta_usa.py の出力; clause/label を含む。
+                                 label ∈ {PROFILE, NONE, PII}。Method A/B は PROFILE と NONE を使う)
 
 出力
 ----
   data/03_method_a_stats.csv          Method A 全統計(α≤0.10)
   data/03_method_a_candidates.csv     Method A 候補トークン(+ alpha_tier 列)
   data/04_method_b_candidates.csv     Method B 候補フレーズ(+ alpha_tier/source_tokens 列)
-  data/05_text_matched_terms.jsonl    テキスト別の対象表現明細(row_index/uuid/field 付き)
-  data/05_text_set_probabilities.csv  共起セットの出現確率(text_count + tiers_json/n_tier_* 列)
+  data/05_clause_matched_terms.jsonl    clause別の対象表現明細(row_index/uuid/field 付き)
+  data/05_uuid_set_probabilities.csv    共起セット出現確率(uuid単位; uuid_count + tiers/n_tier_*)
+  data/05_field_set_probabilities.csv   共起セット出現確率(field単位; field_count + ...)
+  data/05_clause_set_probabilities.csv  共起セット出現確率(clause単位; clause_count + ...)
+  (--unit で出力単位を選択可。既定は3つすべて)
 
 alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0.01"/"0.05"/"0.10")。
 フレーズ/共起の tier は「そのフレーズに含まれる候補トークンの最も厳しい tier」。
@@ -38,9 +42,10 @@ alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0
   python qpii_pipeline.py method-a --filter 0.01   # 保存済み統計から再フィルタ
   python qpii_pipeline.py method-a --compare       # α=0.01/0.05/0.10 比較
   python qpii_pipeline.py method-b                 # 候補フレーズ
-  python qpii_pipeline.py cooccurrence --sample-ratio 0.01
+  python qpii_pipeline.py cooccurrence              # annotations_pred_usa.jsonl を全件集計
+  python qpii_pipeline.py cooccurrence --input my_preds.jsonl --sample-ratio 0.1
   python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
-  python qpii_pipeline.py all --sample-ratio 0.01  # 全ステージ
+  python qpii_pipeline.py all                        # 全ステージ
 """
 
 from __future__ import annotations
@@ -70,14 +75,15 @@ except NameError:
 from config import ALPHA, DATA_DIR, KEEP_POS_PREFIXES, TEXT_FIELDS
 
 # ── パス ────────────────────────────────────────────────────────────────────
-LABELED_CLAUSES_PATH: Path = DATA_DIR / "02_labeled_clauses.csv"
+# 入力は annotate_with_deberta_usa.py の予測アノテーション(JSONL, clause/label を含む)。
+# .csv を渡せば従来の data/02_labeled_clauses.csv 形式も読める(read_labeled_clauses 参照)。
+LABELED_CLAUSES_PATH: Path = DATA_DIR.parent / "annotations_pred_usa.jsonl"
 
 A_STATS_PATH: Path        = DATA_DIR / "03_method_a_stats.csv"
 A_CANDIDATES_PATH: Path   = DATA_DIR / "03_method_a_candidates.csv"
 B_CANDIDATES_PATH: Path   = DATA_DIR / "04_method_b_candidates.csv"
-COOC_TEXT_OUTPUT: Path    = DATA_DIR / "05_text_matched_terms.jsonl"
-COOC_TERM_OUTPUT: Path    = DATA_DIR / "05_text_set_probabilities.csv"
-COOC_SQLITE_PATH: Path    = DATA_DIR / "05_text_sets.sqlite3"
+COOC_OUT_PREFIX: Path     = DATA_DIR / "05"   # <prefix>_<unit>_set_probabilities.csv 等
+COOC_UNITS: tuple[str, ...] = ("uuid", "field", "clause")  # 共起セットの集計単位
 
 # Method A: 統計キャッシュを作る最も緩い閾値
 MAX_ALPHA: float = 0.10
@@ -318,15 +324,51 @@ def _ma_fisher_batch(tokens: list[str]) -> list[dict]:
     return rows
 
 
+def read_labeled_clauses(path: Path) -> pd.DataFrame:
+    """clause/label を持つ入力を DataFrame で返す。
+
+    .jsonl/.ndjson は逐次パースで clause/label のみ抽出(巨大ファイルでも省メモリ)。
+    .csv は従来どおり pandas で読む(旧 data/02_labeled_clauses.csv 互換)。
+    """
+    suffix = path.suffix.lower()
+    if suffix in {".jsonl", ".ndjson"}:
+        clauses: list[str] = []
+        labels: list[str] = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in tqdm(f, desc=f"Reading {path.name}", leave=False):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                clause = rec.get("clause")
+                label = rec.get("label")
+                if clause is None or label is None:
+                    continue
+                clauses.append(str(clause))
+                labels.append(str(label))
+        df = pd.DataFrame({"clause": clauses, "label": labels})
+    else:
+        df = pd.read_csv(path)
+    if "clause" not in df.columns or "label" not in df.columns:
+        raise ValueError(f"入力に 'clause' と 'label' 列が必要です: {path}")
+    return df
+
+
 def build_stats_cache(workers: int = 1, batch_size: int = 256) -> pd.DataFrame:
     """トークン化 + Fisher 検定を並列実行し、全統計を A_STATS_PATH へ保存。
 
     Bonferroni 補正 α=MAX_ALPHA を通過したトークンのみ保持する。
     """
     if not LABELED_CLAUSES_PATH.exists():
-        raise FileNotFoundError(f"Required input not found: {LABELED_CLAUSES_PATH}")
+        raise FileNotFoundError(
+            f"入力が見つかりません: {LABELED_CLAUSES_PATH}\n"
+            f"先に annotate_with_deberta_usa.py で予測アノテーションを作成してください。"
+        )
 
-    df = pd.read_csv(LABELED_CLAUSES_PATH)
+    df = read_labeled_clauses(LABELED_CLAUSES_PATH)
     profile_texts: list[str] = df[df["label"] == "PROFILE"]["clause"].tolist()
     none_texts: list[str]    = df[df["label"] == "NONE"]["clause"].tolist()
     print(f"PROFILE clauses : {len(profile_texts)}")
@@ -509,10 +551,13 @@ def run_method_b(
     token_tier = token_tier or {}
     download_nltk_data()
     if not LABELED_CLAUSES_PATH.exists():
-        raise FileNotFoundError(f"Run labeling first: {LABELED_CLAUSES_PATH}")
+        raise FileNotFoundError(
+            f"入力が見つかりません: {LABELED_CLAUSES_PATH}\n"
+            f"先に annotate_with_deberta_usa.py で予測アノテーションを作成してください。"
+        )
 
     print(f"Candidate tokens (Method A): {len(candidate_tokens)}")
-    df_clauses = pd.read_csv(LABELED_CLAUSES_PATH)
+    df_clauses = read_labeled_clauses(LABELED_CLAUSES_PATH)
     profile_clauses: list[str] = (
         df_clauses[df_clauses["label"] == "PROFILE"]["clause"].tolist()
     )
@@ -656,88 +701,114 @@ def extract_text_terms(text: str) -> list[str]:
     return sorted(phrases)
 
 
-def _process_row_task(task: dict) -> list[dict]:
-    """1レコードを処理し、テキスト(フィールド)単位の共起セットを複数返す。"""
-    out: list[dict] = []
-    for item in task["texts"]:
-        out.append({
-            "row_index": task["row_index"],
-            "uuid": task["uuid"],
-            "field": item["field"],
-            "matched_terms": extract_text_terms(item["text"]),
-        })
+def _process_record_task(task: dict) -> dict:
+    """1レコードを処理し、各 clause の (field, 表現集合) を返す。
+
+    抽出は clause 単位で行い、field/uuid 単位はその和集合として後段で集計する
+    (3粒度で一貫させるため)。
+    """
+    clauses_terms = [
+        (field, extract_text_terms(clause)) for field, clause in task["items"]
+    ]
+    return {"row_index": task["row_index"], "uuid": task["uuid"], "clauses": clauses_terms}
+
+
+def _process_record_batch(tasks: list[dict]) -> tuple[list[dict], int]:
+    out = [_process_record_task(t) for t in tasks]
+    return out, len(tasks)  # 第2要素は処理した「レコード数」
+
+
+def record_unit_sets(record_result: dict, units: list[str]) -> dict[str, list[list[str]]]:
+    """worker 出力から、指定単位ごとの term set(sorted unique)のリストを返す。
+
+    clause: 各 clause が1セット / field: 同一 field の clause を和集合して1セット /
+    uuid: レコード全体(全 field・全 clause)を和集合して1セット。
+    """
+    clauses = record_result["clauses"]  # [(field, terms), ...]
+    out: dict[str, list[list[str]]] = {}
+    if "clause" in units:
+        out["clause"] = [sorted(set(terms)) for _f, terms in clauses]
+    if "field" in units:
+        acc: dict[str, set] = {}
+        for field, terms in clauses:
+            acc.setdefault(field, set()).update(terms)
+        out["field"] = [sorted(s) for s in acc.values()]
+    if "uuid" in units:
+        u: set = set()
+        for _f, terms in clauses:
+            u.update(terms)
+        out["uuid"] = [sorted(u)]
     return out
 
 
-def _process_row_batch_task(tasks: list[dict]) -> tuple[list[dict], int]:
-    out: list[dict] = []
-    for task in tasks:
-        out.extend(_process_row_task(task))
-    return out, len(tasks)  # 第2要素は処理した「レコード数」(進捗・件数換算用)
+_NO_UUID = object()  # iter_jsonl_record_tasks の番兵
 
 
-def normalize_to_text_list(value) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        v = value.strip()
-        return [v] if v else []
-    if isinstance(value, (list, tuple)):
-        out: list[str] = []
-        for item in value:
-            if item is None:
-                continue
-            v = item.strip() if isinstance(item, str) else str(item).strip()
-            if v:
-                out.append(v)
-        return out
-    v = str(value).strip()
-    return [v] if v else []
-
-
-def _resolve_field_texts(row: dict, requested_fields: list[str]) -> list[dict]:
-    out: list[dict] = []
-    for field in requested_fields:
-        candidates = [field]
-        if field in {"skills_and_expertise", "hobbies_and_interests"}:
-            candidates.append(f"{field}_list")
-        elif field.endswith("_list"):
-            candidates.append(field[: -len("_list")])
-
-        value = None
-        for name in candidates:
-            if name in row:
-                value = row.get(name)
-                break
-
-        for text in normalize_to_text_list(value):
-            out.append({"field": field, "text": text})
-    return out
-
-
-def iter_sampled_row_tasks(
-    dataset_name: str,
-    split: str,
-    streaming: bool,
+def iter_jsonl_record_tasks(
+    path: Path,
     sample_ratio: float,
     seed: Optional[int],
     max_rows: int,
     requested_fields: list[str],
 ) -> Iterable[dict]:
-    from datasets import load_dataset  # type: ignore
+    """annotations_pred_usa.jsonl(clause 単位)を読み、レコード(uuid)単位でまとめて
 
+    {row_index, uuid, texts:[{field, text}]} を生成する。
+    text は同一(record, field)の clause を ' . ' で連結したもの(=テキスト/フィールド単位)。
+    入力は同一レコードが連続して並んでいる前提(annotate_with_deberta_usa.py の出力順)。
+    sample_ratio / max_rows はレコード(uuid)単位で適用する。
+    """
     rng = random.Random(seed)
-    ds = load_dataset(dataset_name, split=split, streaming=streaming)
+    field_order = list(requested_fields)
+    field_set = set(requested_fields)
 
-    for i, row in enumerate(ds):
-        if max_rows > 0 and i >= max_rows:
-            break
-        if sample_ratio < 1.0 and rng.random() > sample_ratio:
-            continue
-        texts = _resolve_field_texts(row, requested_fields)
-        if not texts:
-            continue
-        yield {"row_index": i, "uuid": row.get("uuid"), "texts": texts}
+    cur_uuid: Any = _NO_UUID
+    cur_row_index = None
+    cur_keep = False
+    cur_fields: dict[str, list[str]] = {}
+    yielded = 0
+
+    def build_task() -> dict:
+        # clause 単位で抽出するため、joinせず (field, clause) のまま渡す。
+        items = [
+            (f, c) for f in field_order for c in cur_fields.get(f, [])
+        ]
+        return {"row_index": cur_row_index, "uuid": cur_uuid, "items": items}
+
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            uuid = rec.get("uuid")
+            if uuid != cur_uuid:
+                # 直前レコードを確定
+                if cur_uuid is not _NO_UUID and cur_keep:
+                    task = build_task()
+                    if task["items"]:
+                        yield task
+                        yielded += 1
+                        if max_rows > 0 and yielded >= max_rows:
+                            return
+                # 新レコード開始(サンプリング判定は uuid 単位で1回)
+                cur_uuid = uuid
+                cur_row_index = rec.get("row_index")
+                cur_fields = {}
+                cur_keep = sample_ratio >= 1.0 or rng.random() <= sample_ratio
+            if cur_keep:
+                field = rec.get("field")
+                clause = rec.get("clause")
+                if field in field_set and clause:
+                    cur_fields.setdefault(field, []).append(str(clause))
+        # 最後のレコードを確定
+        if cur_uuid is not _NO_UUID and cur_keep:
+            task = build_task()
+            if task["items"]:
+                yield task
 
 
 def iter_row_task_batches(row_tasks: Iterable[dict], batch_size: int) -> Iterable[list[dict]]:
@@ -774,22 +845,21 @@ def flush_set_buffer(conn: sqlite3.Connection, buf: list[tuple[str]]) -> None:
 
 def export_set_probabilities(
     conn: sqlite3.Connection,
-    total_texts: int,
+    total_units: int,
     output_path: Path,
     token_tier: Optional[dict[str, str]] = None,
+    count_col: str = "text_count",
 ) -> int:
     conn.execute("DROP TABLE IF EXISTS set_counts;")
     conn.execute(
         """
         CREATE TABLE set_counts AS
-        SELECT term_set_key, COUNT(*) AS text_count
+        SELECT term_set_key, COUNT(*) AS cnt
         FROM raw_sets
         GROUP BY term_set_key
         """
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_set_counts_count ON set_counts(text_count DESC);"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_set_counts_count ON set_counts(cnt DESC);")
     conn.commit()
 
     cur = conn.execute("SELECT COUNT(*) FROM set_counts")
@@ -799,12 +869,12 @@ def export_set_probabilities(
     with output_path.open("w", encoding="utf-8", newline="") as fw:
         writer = csv.writer(fw)
         writer.writerow([
-            "terms_json", "tiers_json", "set_size", "text_count", "probability",
+            "terms_json", "tiers_json", "set_size", count_col, "probability",
             "n_tier_001", "n_tier_005", "n_tier_010",
         ])
         for term_set_key, cnt in conn.execute(
-            "SELECT term_set_key, text_count FROM set_counts "
-            "ORDER BY text_count DESC, term_set_key ASC"
+            "SELECT term_set_key, cnt FROM set_counts "
+            "ORDER BY cnt DESC, term_set_key ASC"
         ):
             try:
                 terms = json.loads(term_set_key)
@@ -815,7 +885,7 @@ def export_set_probabilities(
             n001 = sum(1 for t in tiers if t == "0.01")
             n005 = sum(1 for t in tiers if t == "0.05")
             n010 = sum(1 for t in tiers if t == "0.10")
-            p = (cnt / total_texts) if total_texts > 0 else 0.0
+            p = (cnt / total_units) if total_units > 0 else 0.0
             writer.writerow([
                 term_set_key, tiers_json, len(terms), cnt, p, n001, n005, n010,
             ])
@@ -829,24 +899,35 @@ def run_cooccurrence(
 ) -> None:
     if not candidate_tokens:
         raise RuntimeError("候補トークンが0件です。閾値や Method A の結果を見直してください。")
+    if not args.input.exists():
+        raise FileNotFoundError(
+            f"共起集計の入力が見つかりません: {args.input}\n"
+            f"先に annotate_with_deberta_usa.py で予測アノテーションを作成してください。"
+        )
 
     download_nltk_data()
 
     workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
     workers = max(1, workers)
     requested_fields = list(TEXT_FIELDS)
+    units = list(args.unit)
+    prefix = str(args.out_prefix)
 
-    conn = setup_sqlite(args.sqlite_path)
-    set_insert_buffer: list[tuple[str]] = []
-    inserted_set_rows = 0
-    total_texts = 0
+    # 単位ごとに SQLite / バッファ / カウントを用意
+    conns: dict[str, sqlite3.Connection] = {}
+    buffers: dict[str, list[tuple[str]]] = {}
+    totals: dict[str, int] = {}
+    for u in units:
+        conns[u] = setup_sqlite(Path(f"{prefix}_{u}_sets.sqlite3"))
+        buffers[u] = []
+        totals[u] = 0
+
+    detail_path = Path(f"{prefix}_clause_matched_terms.jsonl")
     sampled_rows = 0
     started = time.time()
 
-    row_tasks = iter_sampled_row_tasks(
-        dataset_name=args.dataset,
-        split=args.split,
-        streaming=not args.no_streaming,
+    row_tasks = iter_jsonl_record_tasks(
+        path=args.input,
         sample_ratio=args.sample_ratio,
         seed=args.seed,
         max_rows=args.max_rows,
@@ -854,7 +935,7 @@ def run_cooccurrence(
     )
     row_task_batches = iter_row_task_batches(row_tasks, batch_size=max(1, args.row_batch_size))
 
-    with args.text_output.open("w", encoding="utf-8") as fw:
+    with detail_path.open("w", encoding="utf-8") as fw:
         ctx = mp.get_context("spawn")
         with ctx.Pool(
             processes=workers,
@@ -862,51 +943,52 @@ def run_cooccurrence(
             initargs=(sorted(candidate_tokens), args.drop_single_word),
         ) as pool:
             for row_result, rows_done in pool.imap_unordered(
-                _process_row_batch_task,
+                _process_record_batch,
                 row_task_batches,
                 chunksize=max(1, args.pool_chunksize),
             ):
                 sampled_rows += rows_done
                 for rec in row_result:
-                    terms = rec["matched_terms"]
-                    fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    total_texts += 1
-                    unique_sorted = sorted(set(terms))
-                    term_set_key = json.dumps(unique_sorted, ensure_ascii=False)
-                    set_insert_buffer.append((term_set_key,))
-                    if len(set_insert_buffer) >= args.sqlite_insert_buffer:
-                        flush_set_buffer(conn, set_insert_buffer)
-                        inserted_set_rows += args.sqlite_insert_buffer
+                    # clause 単位の明細を書き出し
+                    for field, terms in rec["clauses"]:
+                        fw.write(json.dumps({
+                            "row_index": rec["row_index"], "uuid": rec["uuid"],
+                            "field": field, "matched_terms": terms,
+                        }, ensure_ascii=False) + "\n")
+                    # 各単位のセットを SQLite へ
+                    sets = record_unit_sets(rec, units)
+                    for u in units:
+                        for s in sets[u]:
+                            buffers[u].append((json.dumps(s, ensure_ascii=False),))
+                            totals[u] += 1
+                            if len(buffers[u]) >= args.sqlite_insert_buffer:
+                                flush_set_buffer(conns[u], buffers[u])
 
                 if args.progress_every > 0 and sampled_rows % args.progress_every == 0:
                     elapsed = max(1e-9, time.time() - started)
-                    rps = sampled_rows / elapsed
-                    print(
-                        f"[progress] sampled_rows={sampled_rows} "
-                        f"total_texts={total_texts} "
-                        f"inserted_sets={inserted_set_rows + len(set_insert_buffer)} "
-                        f"speed={rps:.2f} rows/s"
-                    )
+                    counts = " ".join(f"{u}={totals[u]}" for u in units)
+                    print(f"[progress] records={sampled_rows} {counts} "
+                          f"speed={sampled_rows / elapsed:.2f} rec/s")
 
-    inserted_set_rows += len(set_insert_buffer)
-    flush_set_buffer(conn, set_insert_buffer)
-    set_types = export_set_probabilities(
-        conn, total_texts=total_texts, output_path=args.term_output,
-        token_tier=token_tier,
-    )
-    conn.close()
+    # 単位ごとに確率表を出力
+    results: dict[str, tuple[int, int, Path]] = {}
+    for u in units:
+        flush_set_buffer(conns[u], buffers[u])
+        out_csv = Path(f"{prefix}_{u}_set_probabilities.csv")
+        set_types = export_set_probabilities(
+            conns[u], total_units=totals[u], output_path=out_csv,
+            token_tier=token_tier, count_col=f"{u}_count",
+        )
+        conns[u].close()
+        results[u] = (totals[u], set_types, out_csv)
 
     elapsed = time.time() - started
-    print(f"candidate_tokens={len(candidate_tokens)}")
-    print(f"workers={workers}")
-    print(f"sampled_rows={sampled_rows}")
-    print(f"total_texts={total_texts}")
-    print(f"set_rows_inserted={inserted_set_rows}")
-    print(f"set_types={set_types}")
-    print(f"elapsed_sec={elapsed:.2f}")
-    print(f"text_output={args.text_output}")
-    print(f"term_output={args.term_output}")
-    print(f"sqlite_path={args.sqlite_path}")
+    print(f"\ncandidate_tokens={len(candidate_tokens)}  workers={workers}  "
+          f"records={sampled_rows}  elapsed_sec={elapsed:.2f}")
+    for u in units:
+        total, set_types, out_csv = results[u]
+        print(f"  [{u:6s}] sets={total}  unique_sets={set_types}  → {out_csv}")
+    print(f"  detail(clause) → {detail_path}")
 
 
 # ── サブコマンド: cooccurrence ────────────────────────────────────────────────
@@ -954,19 +1036,24 @@ def _heaps_estimate(
 def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
     if not candidate_tokens:
         raise RuntimeError("候補トークンが0件です。先に method-a を実行してください。")
+    if not args.input.exists():
+        raise FileNotFoundError(
+            f"共起集計の入力が見つかりません: {args.input}\n"
+            f"先に annotate_with_deberta_usa.py で予測アノテーションを作成してください。"
+        )
     download_nltk_data()
     workers = resolve_workers(args.workers)
     test_rows = max(1, args.test_rows)
     target_rows = max(1, args.target_rows)
     requested_fields = list(TEXT_FIELDS)
+    units = list(args.unit)
 
-    # Heaps 則フィット用のチェックポイント
+    # Heaps 則フィット用のチェックポイント(レコード数)
     fracs = (0.1, 0.25, 0.5, 0.75, 1.0)
     pending = sorted({max(1, int(test_rows * f)) for f in fracs})
 
-    row_tasks = iter_sampled_row_tasks(
-        dataset_name=args.dataset, split=args.split,
-        streaming=not args.no_streaming,
+    row_tasks = iter_jsonl_record_tasks(
+        path=args.input,
         sample_ratio=1.0,          # 先頭から連続 test_rows 件を処理
         seed=args.seed, max_rows=test_rows,
         requested_fields=requested_fields,
@@ -974,15 +1061,15 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
     batches = iter_row_task_batches(row_tasks, batch_size=max(1, args.row_batch_size))
 
     seen_phrases: set[str] = set()
-    seen_sets: set[str] = set()
+    seen_sets: dict[str, set] = {u: set() for u in units}     # 単位ごとのユニークセット
+    unit_counts: dict[str, int] = {u: 0 for u in units}        # 単位ごとの延べセット数
     total_occ = 0
-    rows = 0            # 処理済みレコード数(=データセット行数)
-    texts = 0           # 処理済みテキスト数(=共起セット数)
-    phrase_snaps: list[tuple[int, int]] = []  # (rows, unique phrases)
-    set_snaps: list[tuple[int, int]] = []     # (rows, unique text-level sets)
-    t_first: Optional[float] = None  # 初回バッチ到着まで(DL+spawn のウォームアップ)
+    rows = 0
+    phrase_snaps: list[tuple[int, int]] = []
+    set_snaps: dict[str, list[tuple[int, int]]] = {u: [] for u in units}
+    t_first: Optional[float] = None
 
-    print(f"[benchmark] test_rows={test_rows} workers={workers} dataset={args.dataset}")
+    print(f"[benchmark] test_rows={test_rows} workers={workers} units={units} input={args.input}")
     started = time.time()
     ctx = mp.get_context("spawn")
     with ctx.Pool(
@@ -990,73 +1077,71 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
         initargs=(sorted(candidate_tokens), args.drop_single_word),
     ) as pool:
         for row_result, rows_done in pool.imap_unordered(
-            _process_row_batch_task, batches, chunksize=max(1, args.pool_chunksize)
+            _process_record_batch, batches, chunksize=max(1, args.pool_chunksize)
         ):
             if t_first is None:
                 t_first = time.time() - started
-            for rec in row_result:               # rec はテキスト(フィールド)単位
-                texts += 1
-                terms = rec["matched_terms"]
-                total_occ += len(terms)
-                seen_phrases.update(terms)
-                seen_sets.add(json.dumps(sorted(set(terms)), ensure_ascii=False))
+            for rec in row_result:
+                for _field, terms in rec["clauses"]:
+                    total_occ += len(terms)
+                    seen_phrases.update(terms)
+                sets = record_unit_sets(rec, units)
+                for u in units:
+                    for s in sets[u]:
+                        unit_counts[u] += 1
+                        seen_sets[u].add(json.dumps(s, ensure_ascii=False))
             rows += rows_done
-            if pending and rows >= pending[0]:    # レコード数でチェックポイント
+            if pending and rows >= pending[0]:
                 while pending and rows >= pending[0]:
                     pending.pop(0)
                 phrase_snaps.append((rows, len(seen_phrases)))
-                set_snaps.append((rows, len(seen_sets)))
+                for u in units:
+                    set_snaps[u].append((rows, len(seen_sets[u])))
     elapsed = time.time() - started
 
-    if rows == 0 or texts == 0:
-        print("[benchmark] 処理レコード/テキストが0件でした。dataset/split/フィールド設定を確認してください。")
+    if rows == 0:
+        print("[benchmark] 処理レコードが0件でした。入力/フィールド設定を確認してください。")
         return
 
     if not phrase_snaps or phrase_snaps[-1][0] != rows:
         phrase_snaps.append((rows, len(seen_phrases)))
-        set_snaps.append((rows, len(seen_sets)))
+        for u in units:
+            set_snaps[u].append((rows, len(seen_sets[u])))
 
     rate = rows / elapsed if elapsed > 0 else float("inf")
-    texts_per_row = texts / rows
-    avg_phrases_text = total_occ / texts
     est_time = target_rows / rate if rate > 0 else float("inf")
-    est_texts = texts_per_row * target_rows
     est_occ = (total_occ / rows) * target_rows
     est_uphr, beta_p = _heaps_estimate(phrase_snaps, target_rows)
-    est_usets, beta_s = _heaps_estimate(set_snaps, target_rows)
-    lin_uphr = len(seen_phrases) / rows * target_rows
-    lin_usets = len(seen_sets) / rows * target_rows
-
     bp = f"Heaps β={beta_p:.3f}" if beta_p is not None else "線形"
-    bs = f"Heaps β={beta_s:.3f}" if beta_s is not None else "線形"
+    warm = t_first if t_first is not None else 0.0
 
     print("\n" + "=" * 64)
-    print(f"  ベンチマーク実測 ({rows:,} レコード / {texts:,} テキスト)")
+    print(f"  ベンチマーク実測 ({rows:,} レコード)")
     print("=" * 64)
-    warm = t_first if t_first is not None else 0.0
     print(f"  処理時間              : {_fmt_duration(elapsed)} ({elapsed:.1f}s)")
     print(f"   うちウォームアップ   : {warm:.1f}s (初回DL+spawn)")
     print(f"  全体スループット      : {rate:.1f} レコード/秒")
-    print(f"  テキスト数 / レコード : {texts_per_row:.2f}")
-    print(f"  平均 phrase / テキスト: {avg_phrases_text:.2f}")
     print(f"  ユニーク phrase       : {len(seen_phrases):,}")
-    print(f"  ユニーク 共起セット   : {len(seen_sets):,} (テキスト単位)")
     print(f"  延べ phrase 出現      : {total_occ:,}")
+    print(f"  単位別 セット数(延べ/ユニーク):")
+    for u in units:
+        print(f"    {u:6s}: {unit_counts[u]:,} / {len(seen_sets[u]):,}  "
+              f"({unit_counts[u] / rows:.2f} セット/レコード)")
     print("\n" + "-" * 64)
     print(f"  {target_rows:,} レコードへの外挿")
     print("-" * 64)
     print(f"  推定処理時間          : {_fmt_duration(est_time)}  (@{rate:.0f} rec/s, 線形)")
-    print(f"  延べテキスト(=セット) : 約 {est_texts:,.0f}")
     print(f"  延べ phrase 出現      : 約 {est_occ:,.0f}  (線形)")
     print(f"  ユニーク phrase       : 約 {est_uphr:,.0f}  ({bp})")
-    print(f"     参考: 線形外挿      : 約 {lin_uphr:,.0f}")
-    print(f"  ユニーク 共起セット   : 約 {est_usets:,.0f}  ({bs})")
-    print(f"     参考: 線形外挿      : 約 {lin_usets:,.0f}")
+    for u in units:
+        est_sets, beta_u = _heaps_estimate(set_snaps[u], target_rows)
+        bu = f"Heaps β={beta_u:.3f}" if beta_u is not None else "線形"
+        est_total = (unit_counts[u] / rows) * target_rows
+        print(f"  [{u:6s}] 延べセット 約 {est_total:,.0f} / "
+              f"ユニーク 約 {est_sets:,.0f} ({bu})")
     print("=" * 64)
-    print("注: 共起セットはテキスト(フィールド)単位。ユニーク数は語彙成長(Heaps則)で")
-    print("    逓減するため Heaps 推定が主、線形は上限目安。")
+    print("注: ユニーク数は語彙成長(Heaps則)で逓減するため Heaps 推定が主。")
     print("    時間推定はウォームアップ(初回DL+spawn)を含む全体スループットの線形外挿。")
-    print("    『ウォームアップ』が処理時間の大半を占める場合は test-rows が小さすぎるサイン。")
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
@@ -1114,20 +1199,21 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
                    help="候補トークンの最小 effect_size (odds ratio)")
     p.add_argument("--drop-single-word", action="store_true",
                    help="1語の表現を除外する(04 の最終出力と同じ挙動)")
-    p.add_argument("--dataset", default="nvidia/Nemotron-Personas-USA")
-    p.add_argument("--split", default="train")
-    p.add_argument("--no-streaming", action="store_true")
-    p.add_argument("--sample-ratio", type=float, default=0.01, help="0.0-1.0")
+    p.add_argument("--input", type=Path, default=LABELED_CLAUSES_PATH,
+                   help="共起集計の入力 JSONL(annotate_with_deberta_usa.py の出力)")
+    p.add_argument("--sample-ratio", type=float, default=1.0,
+                   help="レコード(uuid)単位のサンプリング率 0.0-1.0(既定 1.0=全件)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-rows", type=int, default=0, help="0で上限なし")
+    p.add_argument("--max-rows", type=int, default=0, help="0で上限なし(レコード数)")
     p.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
     p.add_argument("--row-batch-size", type=int, default=128, help="ワーカーへ渡す行バッチサイズ")
     p.add_argument("--pool-chunksize", type=int, default=64, help="imap_unordered の chunksize")
     p.add_argument("--progress-every", type=int, default=10)
-    p.add_argument("--text-output", type=Path, default=COOC_TEXT_OUTPUT)
-    p.add_argument("--term-output", type=Path, default=COOC_TERM_OUTPUT)
-    p.add_argument("--sqlite-path", type=Path, default=COOC_SQLITE_PATH,
-                   help="セット集計に使うSQLite DBパス")
+    p.add_argument("--unit", nargs="+", choices=["uuid", "field", "clause"],
+                   default=list(COOC_UNITS),
+                   help="共起セットの集計単位(複数可)。既定は uuid/field/clause すべて")
+    p.add_argument("--out-prefix", type=Path, default=COOC_OUT_PREFIX,
+                   help="出力接頭辞。<prefix>_<unit>_set_probabilities.csv 等を生成")
     p.add_argument("--sqlite-insert-buffer", type=int, default=20000,
                    help="SQLiteへ一括INSERTするバッファ行数")
 

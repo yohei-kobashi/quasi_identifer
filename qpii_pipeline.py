@@ -29,7 +29,8 @@
   data/05_uuid_set_probabilities.csv    共起セット出現確率(uuid単位; uuid_count + tiers/n_tier_*)
   data/05_field_set_probabilities.csv   共起セット出現確率(field単位; field_count + ...)
   data/05_clause_set_probabilities.csv  共起セット出現確率(clause単位; clause_count + ...)
-  (--unit で出力単位を選択可。既定は3つすべて)
+  data/05_<unit>_pairs.csv              phrase ペア共起(co_count/count_a/count_b/probability/pmi/tier)
+  (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
 alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0.01"/"0.05"/"0.10")。
 フレーズ/共起の tier は「そのフレーズに含まれる候補トークンの最も厳しい tier」。
@@ -53,6 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import multiprocessing as mp
 import os
 import random
@@ -61,6 +63,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -976,6 +979,57 @@ def export_set_probabilities(
     return set_types
 
 
+def export_pairs(
+    conn: sqlite3.Connection,
+    total_units: int,
+    output_path: Path,
+    min_pair_count: int,
+    token_tier: Optional[dict[str, str]] = None,
+) -> int:
+    """phrase ペアの共起回数 + PMI を出力する(案B)。
+
+    phrase_occ(p) と pair_occ(a,b) を GROUP BY して集計。co_count>=min_pair_count のみ出力。
+    PMI = log2( co_count * N / (count_a * count_b) )、N=total_units。
+    """
+    token_tier = token_tier or {}
+    # 単独 phrase 出現数(=その phrase を含む単位数)
+    conn.execute("DROP TABLE IF EXISTS phrase_counts;")
+    conn.execute("CREATE TABLE phrase_counts AS SELECT p, COUNT(*) AS c FROM phrase_occ GROUP BY p")
+    conn.commit()
+    phrase_count: dict[str, int] = {p: c for p, c in conn.execute("SELECT p, c FROM phrase_counts")}
+
+    conn.execute("DROP TABLE IF EXISTS pair_counts;")
+    conn.execute("CREATE TABLE pair_counts AS SELECT a, b, COUNT(*) AS c FROM pair_occ GROUP BY a, b")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pair_c ON pair_counts(c DESC);")
+    conn.commit()
+
+    n_pairs = 0
+    with output_path.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow([
+            "phrase_a", "phrase_b", "co_count", "count_a", "count_b",
+            "probability", "pmi", "tier_a", "tier_b",
+        ])
+        for a, b, c in conn.execute(
+            "SELECT a, b, c FROM pair_counts WHERE c >= ? ORDER BY c DESC, a ASC, b ASC",
+            (min_pair_count,),
+        ):
+            ca = phrase_count.get(a, 0)
+            cb = phrase_count.get(b, 0)
+            prob = c / total_units if total_units > 0 else 0.0
+            if total_units > 0 and ca > 0 and cb > 0:
+                pmi = math.log2((c * total_units) / (ca * cb))
+            else:
+                pmi = 0.0
+            writer.writerow([
+                a, b, c, ca, cb, prob, round(pmi, 4),
+                phrase_alpha_tier(a, token_tier) or "",
+                phrase_alpha_tier(b, token_tier) or "",
+            ])
+            n_pairs += 1
+    return n_pairs
+
+
 def run_cooccurrence(
     args: argparse.Namespace,
     candidate_tokens: set[str],
@@ -1002,14 +1056,35 @@ def run_cooccurrence(
     units = list(args.unit)
     prefix = str(args.out_prefix)
 
+    emit_pairs = args.pairs
+
     # 単位ごとに SQLite / バッファ / カウントを用意
     conns: dict[str, sqlite3.Connection] = {}
     buffers: dict[str, list[tuple[str]]] = {}
+    phrase_buffers: dict[str, list[tuple[str]]] = {}
+    pair_buffers: dict[str, list[tuple[str, str]]] = {}
     totals: dict[str, int] = {}
     for u in units:
         conns[u] = setup_sqlite(Path(f"{prefix}_{u}_sets.sqlite3"))
+        if emit_pairs:  # 案B: ペア共起用テーブル
+            conns[u].execute("CREATE TABLE phrase_occ (p TEXT NOT NULL);")
+            conns[u].execute("CREATE TABLE pair_occ (a TEXT NOT NULL, b TEXT NOT NULL);")
+            conns[u].commit()
         buffers[u] = []
+        phrase_buffers[u] = []
+        pair_buffers[u] = []
         totals[u] = 0
+
+    def flush_unit(u: str) -> None:
+        flush_set_buffer(conns[u], buffers[u])
+        if emit_pairs:
+            if phrase_buffers[u]:
+                conns[u].executemany("INSERT INTO phrase_occ (p) VALUES (?)", phrase_buffers[u])
+                phrase_buffers[u].clear()
+            if pair_buffers[u]:
+                conns[u].executemany("INSERT INTO pair_occ (a, b) VALUES (?, ?)", pair_buffers[u])
+                pair_buffers[u].clear()
+            conns[u].commit()
 
     detail_path = Path(f"{prefix}_clause_matched_terms.jsonl")
     sampled_rows = 0
@@ -1044,14 +1119,19 @@ def run_cooccurrence(
                             "row_index": rec["row_index"], "uuid": rec["uuid"],
                             "field": field, "matched_terms": terms,
                         }, ensure_ascii=False) + "\n")
-                    # 各単位のセットを SQLite へ
+                    # 各単位のセットを SQLite へ(＋ペア共起)
                     sets = record_unit_sets(rec, units)
                     for u in units:
                         for s in sets[u]:
                             buffers[u].append((json.dumps(s, ensure_ascii=False),))
                             totals[u] += 1
+                            if emit_pairs:
+                                for p in s:
+                                    phrase_buffers[u].append((p,))
+                                for a, b in combinations(s, 2):  # s はソート済み
+                                    pair_buffers[u].append((a, b))
                             if len(buffers[u]) >= args.sqlite_insert_buffer:
-                                flush_set_buffer(conns[u], buffers[u])
+                                flush_unit(u)
 
                 if args.progress_every > 0 and sampled_rows % args.progress_every == 0:
                     elapsed = max(1e-9, time.time() - started)
@@ -1059,24 +1139,34 @@ def run_cooccurrence(
                     print(f"[progress] records={sampled_rows} {counts} "
                           f"speed={sampled_rows / elapsed:.2f} rec/s")
 
-    # 単位ごとに確率表を出力
-    results: dict[str, tuple[int, int, Path]] = {}
+    # 単位ごとに確率表 + ペア共起を出力
+    results: dict[str, tuple] = {}
     for u in units:
-        flush_set_buffer(conns[u], buffers[u])
+        flush_unit(u)
         out_csv = Path(f"{prefix}_{u}_set_probabilities.csv")
         set_types = export_set_probabilities(
             conns[u], total_units=totals[u], output_path=out_csv,
             token_tier=token_tier, count_col=f"{u}_count",
         )
+        pairs_path = None
+        n_pairs = 0
+        if emit_pairs:
+            pairs_path = Path(f"{prefix}_{u}_pairs.csv")
+            n_pairs = export_pairs(
+                conns[u], total_units=totals[u], output_path=pairs_path,
+                min_pair_count=args.min_pair_count, token_tier=token_tier,
+            )
         conns[u].close()
-        results[u] = (totals[u], set_types, out_csv)
+        results[u] = (totals[u], set_types, out_csv, n_pairs, pairs_path)
 
     elapsed = time.time() - started
     print(f"\ncandidate_tokens={len(candidate_tokens)}  workers={workers}  "
           f"records={sampled_rows}  elapsed_sec={elapsed:.2f}")
     for u in units:
-        total, set_types, out_csv = results[u]
+        total, set_types, out_csv, n_pairs, pairs_path = results[u]
         print(f"  [{u:6s}] sets={total}  unique_sets={set_types}  → {out_csv}")
+        if emit_pairs:
+            print(f"           pairs(co_count≥{args.min_pair_count})={n_pairs}  → {pairs_path}")
     print(f"  detail(clause) → {detail_path}")
 
 
@@ -1318,6 +1408,10 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
     p.add_argument("--unit", nargs="+", choices=["uuid", "field", "clause"],
                    default=list(COOC_UNITS),
                    help="共起セットの集計単位(複数可)。既定は uuid/field/clause すべて")
+    p.add_argument("--pairs", action=argparse.BooleanOptionalAction, default=True,
+                   help="案B: phrase ペアの共起(co_count+PMI)も出力する。--no-pairs で無効")
+    p.add_argument("--min-pair-count", type=int, default=2,
+                   help="ペア出力の最小共起回数(これ未満のペアは出力しない=裾の間引き)")
     p.add_argument("--out-prefix", type=Path, default=COOC_OUT_PREFIX,
                    help="出力接頭辞。<prefix>_<unit>_set_probabilities.csv 等を生成")
     p.add_argument("--sqlite-insert-buffer", type=int, default=20000,

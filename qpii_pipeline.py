@@ -56,12 +56,13 @@ import json
 import multiprocessing as mp
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import nltk
 import pandas as pd
@@ -72,7 +73,7 @@ try:
     sys.path.insert(0, str(Path(__file__).parent))
 except NameError:
     sys.path.insert(0, str(Path.cwd()))
-from config import ALPHA, DATA_DIR, KEEP_POS_PREFIXES, TEXT_FIELDS
+from config import ALPHA, DATA_DIR, KEEP_POS_PREFIXES, MIN_PHRASE_FREQ, TEXT_FIELDS
 
 # ── パス ────────────────────────────────────────────────────────────────────
 # 入力は annotate_with_deberta_usa.py の予測アノテーション(JSONL, clause/label を含む)。
@@ -100,11 +101,75 @@ NP_GRAMMAR: str = r"""
 # ════════════════════════════════════════════════════════════════════════════
 
 def download_nltk_data(with_stopwords: bool = False) -> None:
-    resources = ["punkt_tab", "averaged_perceptron_tagger_eng"]
+    # wordnet/omw は phrase 正規化(lemma化)に使う
+    resources = ["punkt_tab", "averaged_perceptron_tagger_eng", "wordnet", "omw-1.4"]
     if with_stopwords:
         resources.append("stopwords")
     for resource in resources:
         nltk.download(resource, quiet=True)
+
+
+# ── phrase 正規化(案2) ───────────────────────────────────────────────────────
+_DETERMINERS: frozenset[str] = frozenset({"a", "an", "the"})
+_LEMMA_CACHE: dict[str, str] = {}
+
+
+def normalize_phrase(phrase: str, lemmatizer) -> str:
+    """冠詞/限定詞を除去し、各語を名詞 lemma 化して小文字で返す(表記ゆれ統合)。
+
+    例: 'a registered nurses' → 'registered nurse', 'weekend getaways' → 'weekend getaway'。
+    lemmatizer=None なら lemma 化せず冠詞除去+小文字のみ。
+    """
+    out: list[str] = []
+    for w in phrase.lower().split():
+        if w in _DETERMINERS:
+            continue
+        if lemmatizer is not None:
+            lw = _LEMMA_CACHE.get(w)
+            if lw is None:
+                lw = lemmatizer.lemmatize(w)
+                _LEMMA_CACHE[w] = lw
+            w = lw
+        out.append(w)
+    return " ".join(out)
+
+
+def augment_token_tier_with_lemmas(token_tier: dict[str, str]) -> dict[str, str]:
+    """token→tier に lemma キーも足す(正規化 phrase の tier 照合用)。
+
+    'gatherings'→tier に加えて 'gathering'→tier も引けるようにする。
+    同一 lemma に複数 tier が来たら最も厳しいものを採用。
+    """
+    if not token_tier:
+        return dict(token_tier)
+    from nltk.stem import WordNetLemmatizer
+    lem = WordNetLemmatizer()
+    out: dict[str, str] = dict(token_tier)
+    for tok, tier in token_tier.items():
+        lt = lem.lemmatize(tok)
+        if lt == tok:
+            continue
+        prev = out.get(lt)
+        out[lt] = tier if prev is None else (strictest_tier([prev, tier]) or tier)
+    return out
+
+
+def load_allowed_phrases(method_b_csv: Path, min_phrase_freq: int) -> Optional[set[str]]:
+    """Method B 辞書(04 CSV)を freq>=K で絞り、許可フレーズ集合を返す(案1)。
+
+    min_phrase_freq<=0 なら None(フィルタ無効=自由NP)を返す。
+    """
+    if min_phrase_freq <= 0:
+        return None
+    if not method_b_csv.exists():
+        raise FileNotFoundError(
+            f"頻度フィルタ(--min-phrase-freq {min_phrase_freq})に必要な Method B 辞書が"
+            f"見つかりません: {method_b_csv}\n先に `qpii_pipeline.py method-b` を実行してください。"
+        )
+    df = pd.read_csv(method_b_csv)
+    if "phrase" not in df.columns or "freq" not in df.columns:
+        raise ValueError(f"{method_b_csv} に phrase/freq 列が必要です")
+    return set(df[df["freq"] >= min_phrase_freq]["phrase"].astype(str))
 
 
 def make_np_parser() -> "nltk.RegexpParser":
@@ -506,38 +571,44 @@ def cmd_method_a(args: argparse.Namespace) -> None:
 # ── 並列: NP 抽出ワーカー ─────────────────────────────────────────────────────
 _MB_PARSER = None
 _MB_TOKENS: set[str] = set()
+_MB_LEMMATIZER = None
 
 
 def _mb_init(candidate_tokens: list[str]) -> None:
-    global _MB_PARSER, _MB_TOKENS
+    global _MB_PARSER, _MB_TOKENS, _MB_LEMMATIZER
+    import nltk as _nltk
     download_nltk_data()
     _MB_PARSER = make_np_parser()
     _MB_TOKENS = set(candidate_tokens)
+    _MB_LEMMATIZER = _nltk.stem.WordNetLemmatizer()
 
 
 def _mb_batch(
     clauses: list[str],
 ) -> tuple[Counter, dict[str, str], dict[str, list[str]]]:
-    """節バッチを処理し (phrase 頻度, phrase→head, phrase→例文<=3) を返す。"""
+    """節バッチを処理し (phrase 頻度, phrase→head, phrase→例文<=3) を返す。
+
+    候補トークンは単語境界一致(案4)、phrase は正規化(案2)してから集計する。
+    """
     freq: Counter[str] = Counter()
     head: dict[str, str] = {}
     examples: dict[str, list[str]] = defaultdict(list)
     for clause in clauses:
         nps = extract_nps(clause, _MB_PARSER)
-        clause_lower = clause.lower()
-        matched_tokens = [t for t in _MB_TOKENS if t in clause_lower]
+        words = set(re.findall(r"[a-z]+", clause.lower()))   # 案4: 単語境界
+        matched_tokens = _MB_TOKENS & words
         if not matched_tokens:
             continue
         for token in matched_tokens:
             result = find_longest_np_containing(token, nps)
-            if result is None:
-                longest, h = token, token
-            else:
-                longest, h = result
-            freq[longest] += 1
-            head[longest] = h
-            if len(examples[longest]) < 3:
-                examples[longest].append(clause)
+            raw, raw_head = (token, token) if result is None else result
+            phrase = normalize_phrase(raw, _MB_LEMMATIZER)   # 案2: 正規化
+            if not phrase:
+                continue
+            freq[phrase] += 1
+            head[phrase] = normalize_phrase(raw_head, _MB_LEMMATIZER)
+            if len(examples[phrase]) < 3:
+                examples[phrase].append(clause)
     return freq, head, dict(examples)
 
 
@@ -548,8 +619,8 @@ def run_method_b(
     batch_size: int = 256,
 ) -> pd.DataFrame:
     """候補トークンを PROFILE 節中の最長 NP に展開し、フレーズ CSV を保存。"""
-    token_tier = token_tier or {}
     download_nltk_data()
+    token_tier = augment_token_tier_with_lemmas(token_tier or {})  # 正規化phraseの tier 照合用
     if not LABELED_CLAUSES_PATH.exists():
         raise FileNotFoundError(
             f"入力が見つかりません: {LABELED_CLAUSES_PATH}\n"
@@ -666,36 +737,49 @@ def cmd_method_b(args: argparse.Namespace) -> None:
 _WORKER_PARSER = None
 _WORKER_TOKENS: set[str] = set()
 _WORKER_DROP_SINGLE_WORD: bool = False
+_WORKER_ALLOWED: Optional[set[str]] = None   # 案1: 許可フレーズ(None=フィルタ無効)
+_WORKER_LEMMATIZER = None
 
 
-def _init_worker(candidate_tokens: list[str], drop_single_word: bool) -> None:
+def _init_worker(
+    candidate_tokens: list[str],
+    drop_single_word: bool,
+    allowed_phrases: Optional[list[str]] = None,
+) -> None:
     global _WORKER_PARSER, _WORKER_TOKENS, _WORKER_DROP_SINGLE_WORD
+    global _WORKER_ALLOWED, _WORKER_LEMMATIZER
     import nltk as _nltk  # spawn 後の各ワーカーで読み込み
 
-    for resource in ("punkt_tab", "averaged_perceptron_tagger_eng"):
+    for resource in ("punkt_tab", "averaged_perceptron_tagger_eng", "wordnet", "omw-1.4"):
         _nltk.download(resource, quiet=True)
     _WORKER_PARSER = _nltk.RegexpParser(NP_GRAMMAR)
     _WORKER_TOKENS = set(candidate_tokens)
     _WORKER_DROP_SINGLE_WORD = drop_single_word
+    _WORKER_ALLOWED = set(allowed_phrases) if allowed_phrases is not None else None
+    _WORKER_LEMMATIZER = _nltk.stem.WordNetLemmatizer()
 
 
 def extract_text_terms(text: str) -> list[str]:
-    """1テキスト(=1フィールド値)へ Method A → Method B を順に適用し、表現集合を返す。
+    """1テキスト(=1フィールド値/clause)へ Method A → Method B を適用し、表現集合を返す。
 
-    Method A : 候補トークン(_WORKER_TOKENS)が本文に出現するか判定。
-    Method B : 出現した各トークンを、それを含む最長 NP に展開
-               (該当 NP が無ければトークン自身を採用 = 04 main と同じ挙動)。
+    案4: 候補トークン一致は単語境界。案2: 最長 NP を正規化。
+    案1: 許可フレーズ(_WORKER_ALLOWED)が設定されていればそれに含まれる phrase のみ採用。
     """
     if not text:
         return []
     phrases: set[str] = set()
     nps = extract_nps(text, _WORKER_PARSER)
-    text_lower = text.lower()
-    matched_tokens = [t for t in _WORKER_TOKENS if t in text_lower]
+    words = set(re.findall(r"[a-z]+", text.lower()))   # 案4: 単語境界
+    matched_tokens = _WORKER_TOKENS & words
     for token in matched_tokens:
         result = find_longest_np_containing(token, nps)
-        phrase = token if result is None else result[0]
+        raw = token if result is None else result[0]
+        phrase = normalize_phrase(raw, _WORKER_LEMMATIZER)   # 案2: 正規化
+        if not phrase:
+            continue
         if _WORKER_DROP_SINGLE_WORD and len(phrase.split()) < 2:
+            continue
+        if _WORKER_ALLOWED is not None and phrase not in _WORKER_ALLOWED:   # 案1: 頻度フィルタ
             continue
         phrases.add(phrase)
     return sorted(phrases)
@@ -896,6 +980,7 @@ def run_cooccurrence(
     args: argparse.Namespace,
     candidate_tokens: set[str],
     token_tier: Optional[dict[str, str]] = None,
+    allowed_phrases: Optional[set[str]] = None,
 ) -> None:
     if not candidate_tokens:
         raise RuntimeError("候補トークンが0件です。閾値や Method A の結果を見直してください。")
@@ -906,6 +991,10 @@ def run_cooccurrence(
         )
 
     download_nltk_data()
+    token_tier = augment_token_tier_with_lemmas(token_tier or {})  # 正規化phraseの tier 照合用
+    allowed_list = sorted(allowed_phrases) if allowed_phrases is not None else None
+    if allowed_phrases is not None:
+        print(f"許可フレーズ(freq≥{args.min_phrase_freq}): {len(allowed_phrases)}")
 
     workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
     workers = max(1, workers)
@@ -940,7 +1029,7 @@ def run_cooccurrence(
         with ctx.Pool(
             processes=workers,
             initializer=_init_worker,
-            initargs=(sorted(candidate_tokens), args.drop_single_word),
+            initargs=(sorted(candidate_tokens), args.drop_single_word, allowed_list),
         ) as pool:
             for row_result, rows_done in pool.imap_unordered(
                 _process_record_batch,
@@ -999,7 +1088,8 @@ def cmd_cooccurrence(args: argparse.Namespace) -> None:
         min_freq_profile=args.min_freq_profile,
         min_effect_size=args.min_effect_size,
     )
-    run_cooccurrence(args, candidate_tokens, token_tier)
+    allowed = load_allowed_phrases(args.method_b_csv, args.min_phrase_freq)
+    run_cooccurrence(args, candidate_tokens, token_tier, allowed)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1033,7 +1123,11 @@ def _heaps_estimate(
     return float(np.exp(log_k)) * (target ** beta), float(beta)
 
 
-def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
+def run_benchmark(
+    args: argparse.Namespace,
+    candidate_tokens: set[str],
+    allowed_phrases: Optional[set[str]] = None,
+) -> None:
     if not candidate_tokens:
         raise RuntimeError("候補トークンが0件です。先に method-a を実行してください。")
     if not args.input.exists():
@@ -1042,6 +1136,7 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
             f"先に annotate_with_deberta_usa.py で予測アノテーションを作成してください。"
         )
     download_nltk_data()
+    allowed_list = sorted(allowed_phrases) if allowed_phrases is not None else None
     workers = resolve_workers(args.workers)
     test_rows = max(1, args.test_rows)
     target_rows = max(1, args.target_rows)
@@ -1074,7 +1169,7 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
     ctx = mp.get_context("spawn")
     with ctx.Pool(
         workers, initializer=_init_worker,
-        initargs=(sorted(candidate_tokens), args.drop_single_word),
+        initargs=(sorted(candidate_tokens), args.drop_single_word, allowed_list),
     ) as pool:
         for row_result, rows_done in pool.imap_unordered(
             _process_record_batch, batches, chunksize=max(1, args.pool_chunksize)
@@ -1145,12 +1240,13 @@ def run_benchmark(args: argparse.Namespace, candidate_tokens: set[str]) -> None:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
+    allowed = load_allowed_phrases(args.method_b_csv, args.min_phrase_freq)
     candidate_tokens, _ = load_candidates_with_tier(
         args.candidates_csv,
         min_freq_profile=args.min_freq_profile,
         min_effect_size=args.min_effect_size,
     )
-    run_benchmark(args, candidate_tokens)
+    run_benchmark(args, candidate_tokens, allowed)
 
 
 # ── サブコマンド: all(全ステージを一気通貫) ─────────────────────────────────
@@ -1171,11 +1267,16 @@ def cmd_all(args: argparse.Namespace) -> None:
     token_tier = build_token_tier_map(df_a)
 
     print("\n════ Stage 2/3: Method B ════")
-    run_method_b(candidate_tokens, token_tier,
-                 workers=args.workers, batch_size=args.batch_size)
+    df_b = run_method_b(candidate_tokens, token_tier,
+                        workers=args.workers, batch_size=args.batch_size)
+
+    # 案1: Method B 辞書(正規化phrase + freq)を freq≥K で絞り共起の許可語彙にする
+    allowed: Optional[set[str]] = None
+    if args.min_phrase_freq > 0 and not df_b.empty:
+        allowed = set(df_b[df_b["freq"] >= args.min_phrase_freq]["phrase"].astype(str))
 
     print("\n════ Stage 3/3: Record co-occurrence ════")
-    run_cooccurrence(args, candidate_tokens, token_tier)
+    run_cooccurrence(args, candidate_tokens, token_tier, allowed)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1199,6 +1300,11 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
                    help="候補トークンの最小 effect_size (odds ratio)")
     p.add_argument("--drop-single-word", action="store_true",
                    help="1語の表現を除外する(04 の最終出力と同じ挙動)")
+    p.add_argument("--min-phrase-freq", type=int, default=MIN_PHRASE_FREQ,
+                   help="案1 頻度フィルタ: Method B 辞書で freq≥K の phrase のみ共起に採用。"
+                        "0でフィルタ無効(自由NP)")
+    p.add_argument("--method-b-csv", type=Path, default=B_CANDIDATES_PATH,
+                   help="許可フレーズ語彙に使う Method B 辞書 CSV")
     p.add_argument("--input", type=Path, default=LABELED_CLAUSES_PATH,
                    help="共起集計の入力 JSONL(annotate_with_deberta_usa.py の出力)")
     p.add_argument("--sample-ratio", type=float, default=1.0,

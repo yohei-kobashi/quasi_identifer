@@ -32,19 +32,25 @@
   data/05_<unit>_pairs.csv              phrase ペア共起(co_count/count_a/count_b/probability/pmi/tier)
   (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
-alpha_tier は Bonferroni 補正後に通過する最も厳しい有意水準("0.01"/"0.05"/"0.10")。
-フレーズ/共起の tier は「そのフレーズに含まれる候補トークンの最も厳しい tier」。
-全3階層を得るには method-a を α=0.10 で実行する(例: `method-a --alpha 0.10`,
-`all --alpha 0.10`)。
+単語の有意性は FDR(Benjamini-Hochberg)の q 値で判定する(主解析 q=0.05)。
+alpha_tier は q 値が通過する最も厳しい水準("0.01"/"0.05"/"0.10")で、0.01/0.10 は
+主結果に対する感度分析(頑健性確認)に使う。フレーズ/共起の tier は「そのフレーズに
+含まれる候補トークンの最も厳しい tier」。
+
+頻度フィルタの閾値は3層とも学術的基準で決められる(select-thresholds / "auto"):
+  層1 単語   --min-freq-profile : オッズ比95%CI下限>1(Woolf)が95%を満たす最小頻度
+  層2 フレーズ --min-phrase-freq : 2-fold 保留集合再現率 ρ(r)>=0.5(Good-Turing)の最小頻度
+  層3 ペア   --pair-q           : G²尤度比検定(Dunning)+BH-FDR で有意な共起のみ採用
 
 使い方
 ------
-  python qpii_pipeline.py method-a                 # 既定 ALPHA で候補トークン
-  python qpii_pipeline.py method-a --filter 0.01   # 保存済み統計から再フィルタ
-  python qpii_pipeline.py method-a --compare       # α=0.01/0.05/0.10 比較
+  python qpii_pipeline.py method-a                 # FDR q=0.05 で候補トークン
+  python qpii_pipeline.py method-a --filter 0.01   # 保存済み統計から q=0.01 で再フィルタ
+  python qpii_pipeline.py method-a --compare       # 感度分析 q=0.01/0.05/0.10
   python qpii_pipeline.py method-b                 # 候補フレーズ
+  python qpii_pipeline.py select-thresholds        # 3層の頻度閾値を推奨
   python qpii_pipeline.py cooccurrence              # annotations_pred_usa.jsonl を全件集計
-  python qpii_pipeline.py cooccurrence --input my_preds.jsonl --sample-ratio 0.1
+  python qpii_pipeline.py cooccurrence --min-freq-profile auto --min-phrase-freq auto
   python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
   python qpii_pipeline.py all                        # 全ステージ
 """
@@ -69,14 +75,14 @@ from typing import Any, Iterable, Optional
 
 import nltk
 import pandas as pd
-from scipy.stats import fisher_exact
+from scipy.stats import chi2, fisher_exact
 from tqdm import tqdm
 
 try:
     sys.path.insert(0, str(Path(__file__).parent))
 except NameError:
     sys.path.insert(0, str(Path.cwd()))
-from config import ALPHA, DATA_DIR, KEEP_POS_PREFIXES, MIN_PHRASE_FREQ, TEXT_FIELDS
+from config import DATA_DIR, KEEP_POS_PREFIXES, MIN_PHRASE_FREQ, TEXT_FIELDS
 
 # ── パス ────────────────────────────────────────────────────────────────────
 # 入力は annotate_with_deberta_usa.py の予測アノテーション(JSONL, clause/label を含む)。
@@ -209,15 +215,51 @@ def find_longest_np_containing(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 共有: alpha tier(有意水準の階層)
+# 共有: 有意水準の階層(tier)と FDR(Benjamini-Hochberg)
 # ════════════════════════════════════════════════════════════════════════════
+#
+# 主基準は FDR(BH)の q 値。tier はこの q 値が通過する最も厳しい水準
+# ("0.01"/"0.05"/"0.10")を表す。0.01/0.10 は主結果(既定 q=0.05)に対する
+# 感度分析(頑健性確認)として使う。旧 Bonferroni 由来の tier も後方互換で残す。
 
 TIER_ALPHAS: tuple[float, ...] = (0.01, 0.05, 0.10)  # 昇順 = 厳しい順
 TIER_ORDER: dict[str, int] = {"0.01": 0, "0.05": 1, "0.10": 2}
+DEFAULT_Q: float = 0.05  # FDR の既定水準(主解析)
+
+
+def bh_qvalues(pvalues: list[float]) -> list[float]:
+    """Benjamini-Hochberg の q 値(調整 p 値)を入力順で返す。
+
+    q_(i) = min_{k>=i} ( p_(k) * m / k )  (昇順ランク i, 検定数 m)。
+    単調性を保つよう後ろから累積 min を取り、[0,1] にクリップする。
+    """
+    m = len(pvalues)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: pvalues[i])  # p 昇順のインデックス
+    q = [0.0] * m
+    prev = 1.0
+    for rank in range(m, 0, -1):                          # m..1
+        idx = order[rank - 1]
+        val = pvalues[idx] * m / rank
+        prev = min(prev, val)
+        q[idx] = min(1.0, prev)
+    return q
+
+
+def compute_q_tier(q_value: float) -> Optional[str]:
+    """FDR の q 値が通過する最も厳しい水準を返す("0.01"/"0.05"/"0.10")。"""
+    for level in TIER_ALPHAS:
+        if q_value <= level:
+            return f"{level:.2f}"
+    return None
 
 
 def compute_alpha_tier(p_value: float, n_tokens: int) -> Optional[str]:
-    """p値が Bonferroni 補正後に通過する最も厳しい α を返す("0.01"/"0.05"/"0.10")。"""
+    """[後方互換] p値が Bonferroni 補正後に通過する最も厳しい α を返す。
+
+    q_value 列を持たない旧 CSV からの tier 復元用。新規は compute_q_tier を使う。
+    """
     for alpha in TIER_ALPHAS:
         if p_value < alpha / max(n_tokens, 1):
             return f"{alpha:.2f}"
@@ -225,7 +267,7 @@ def compute_alpha_tier(p_value: float, n_tokens: int) -> Optional[str]:
 
 
 def strictest_tier(tiers: Iterable[Optional[str]]) -> Optional[str]:
-    """複数 tier のうち最も厳しい(小さい α)ものを返す。"""
+    """複数 tier のうち最も厳しい(小さい水準)ものを返す。"""
     valid = [t for t in tiers if t in TIER_ORDER]
     if not valid:
         return None
@@ -238,11 +280,18 @@ def phrase_alpha_tier(phrase: str, token_tier: dict[str, str]) -> Optional[str]:
 
 
 def add_alpha_tier_column(df: pd.DataFrame) -> pd.DataFrame:
-    """候補 DataFrame に alpha_tier 列を付与して返す。"""
+    """候補 DataFrame に alpha_tier 列(FDR q 由来の tier)を付与して返す。
+
+    q_value 列があれば FDR ベース、無ければ旧 Bonferroni(p_value/n_tokens)で復元。
+    列名は後方互換のため alpha_tier のまま(意味は「FDR q が通過する最厳水準」)。
+    """
     df = df.copy()
-    df["alpha_tier"] = [
-        compute_alpha_tier(p, int(n)) for p, n in zip(df["p_value"], df["n_tokens"])
-    ]
+    if "q_value" in df.columns:
+        df["alpha_tier"] = [compute_q_tier(float(q)) for q in df["q_value"]]
+    else:
+        df["alpha_tier"] = [
+            compute_alpha_tier(p, int(n)) for p, n in zip(df["p_value"], df["n_tokens"])
+        ]
     return df
 
 
@@ -370,6 +419,8 @@ def _ma_fisher_init(fp, fn, n_profile, n_none, pos_map, corrected_max, n_tokens)
 
 
 def _ma_fisher_batch(tokens: list[str]) -> list[dict]:
+    # FDR(BH)では全検定の p 値が必要なため、Bonferroni による事前足切りはしない。
+    # 検定対象は a>0(PROFILE に1回以上出た)トークンのみ(片側 greater で a=0 は p≈1)。
     rows: list[dict] = []
     for token in tokens:
         a = _MA_FREQ_PROFILE.get(token, 0)
@@ -379,16 +430,17 @@ def _ma_fisher_batch(tokens: list[str]) -> list[dict]:
         c = _MA_FREQ_NONE.get(token, 0)
         d = _MA_N_NONE - c
         _, p_value = fisher_exact([[a, b], [c, d]], alternative="greater")
-        if p_value < _MA_CORRECTED_MAX:
-            rows.append({
-                "token":        token,
-                "pos":          _MA_POS_MAP.get(token, ""),
-                "freq_profile": a,
-                "freq_none":    c,
-                "p_value":      p_value,
-                "effect_size":  odds_ratio(a, b, c, d),
-                "n_tokens":     _MA_N_TOKENS,
-            })
+        rows.append({
+            "token":        token,
+            "pos":          _MA_POS_MAP.get(token, ""),
+            "freq_profile": a,
+            "freq_none":    c,
+            "n_profile":    _MA_N_PROFILE,
+            "n_none":       _MA_N_NONE,
+            "p_value":      p_value,
+            "effect_size":  odds_ratio(a, b, c, d),
+            "n_tokens":     _MA_N_TOKENS,
+        })
     return rows
 
 
@@ -428,7 +480,8 @@ def read_labeled_clauses(path: Path) -> pd.DataFrame:
 def build_stats_cache(workers: int = 1, batch_size: int = 256) -> pd.DataFrame:
     """トークン化 + Fisher 検定を並列実行し、全統計を A_STATS_PATH へ保存。
 
-    Bonferroni 補正 α=MAX_ALPHA を通過したトークンのみ保持する。
+    検定した全トークン(a>0)を保持し、Benjamini-Hochberg の q 値(FDR)を付与する。
+    トークンの採否は後段で q<=Q により決める(主基準 FDR)。
     """
     if not LABELED_CLAUSES_PATH.exists():
         raise FileNotFoundError(
@@ -452,7 +505,7 @@ def build_stats_cache(workers: int = 1, batch_size: int = 256) -> pd.DataFrame:
     n_none    = len(none_texts)
     all_tokens: list[str] = sorted(set(freq_profile.keys()) | set(freq_none.keys()))
     n_tokens = len(all_tokens)
-    corrected_max = MAX_ALPHA / max(n_tokens, 1)
+    corrected_max = MAX_ALPHA / max(n_tokens, 1)  # 互換のため init へ渡すのみ(未使用)
 
     print(f"Running Fisher's exact test on {n_tokens} tokens ...")
     results = parallel_map(
@@ -463,18 +516,41 @@ def build_stats_cache(workers: int = 1, batch_size: int = 256) -> pd.DataFrame:
     )
     rows: list[dict] = [r for batch in results for r in batch]
 
+    # BH(FDR)の q 値を「実際に検定したトークン(a>0)」の集合 m 上で計算する。
+    m_tested = len(rows)
+    pvals = [r["p_value"] for r in rows]
+    qvals = bh_qvalues(pvals)
+    for r, q in zip(rows, qvals):
+        r["q_value"] = q
+        r["n_tested"] = m_tested
+
     df_stats = (
         pd.DataFrame(rows)
-        .sort_values("effect_size", ascending=False)
+        .sort_values(["q_value", "p_value"], ascending=True)
         .reset_index(drop=True)
     )
     df_stats.to_csv(A_STATS_PATH, index=False)
-    print(f"Stats cache saved ({len(df_stats)} tokens, α≤{MAX_ALPHA}) → {A_STATS_PATH}")
+    n_sig = int((df_stats["q_value"] <= DEFAULT_Q).sum())
+    print(f"Stats cache saved ({len(df_stats)} tested tokens; "
+          f"q<= {DEFAULT_Q}: {n_sig}) → {A_STATS_PATH}")
     return df_stats
 
 
+def select_significant(df_stats: pd.DataFrame, q: float) -> pd.DataFrame:
+    """FDR(BH)の q 値が q 以下のトークンを返す(主基準)。
+
+    q_value 列が無い旧キャッシュは Bonferroni(filter_at_alpha)へフォールバック。
+    """
+    if "q_value" not in df_stats.columns:
+        return filter_at_alpha(df_stats, q)
+    df_pass = df_stats[df_stats["q_value"] <= q]
+    if df_pass.empty:
+        print(f"  FDR q<={q} を満たすトークンがありません。最小 q={df_stats['q_value'].min():.3g}")
+    return df_pass.sort_values("effect_size", ascending=False).reset_index(drop=True)
+
+
 def filter_at_alpha(df_stats: pd.DataFrame, alpha: float) -> pd.DataFrame:
-    """指定 alpha で Bonferroni 補正を適用し候補を返す。"""
+    """[後方互換] 指定 alpha で Bonferroni 補正を適用し候補を返す。"""
     n_tokens = int(df_stats["n_tokens"].iloc[0])
     corrected = alpha / max(n_tokens, 1)
     df_pass = df_stats[df_stats["p_value"] < corrected]
@@ -492,27 +568,35 @@ def load_or_build_stats(
 ) -> pd.DataFrame:
     if not force_build and A_STATS_PATH.exists():
         df_stats = pd.read_csv(A_STATS_PATH)
+        if "q_value" not in df_stats.columns:  # 旧 Bonferroni キャッシュは作り直す
+            print("Old stats cache lacks q_value (FDR). Rebuilding ...")
+            return build_stats_cache(workers=workers, batch_size=batch_size)
         print(f"Loaded stats cache: {len(df_stats)} tokens → {A_STATS_PATH}")
         return df_stats
     return build_stats_cache(workers=workers, batch_size=batch_size)
 
 
 def compute_method_a(
-    alpha: float = ALPHA,
+    q: float = DEFAULT_Q,
     force_build: bool = False,
     workers: int = 1,
     batch_size: int = 256,
 ) -> pd.DataFrame:
-    """Method A を実行し、候補トークン DataFrame を返す(候補 CSV も保存)。"""
+    """Method A を実行し、FDR q<=q の候補トークン DataFrame を返す(候補 CSV も保存)。"""
     download_nltk_data(with_stopwords=True)
     df_stats = load_or_build_stats(force_build=force_build, workers=workers, batch_size=batch_size)
-    df_out = add_alpha_tier_column(filter_at_alpha(df_stats, alpha))
+    df_out = add_alpha_tier_column(select_significant(df_stats, q))
     df_out.to_csv(A_CANDIDATES_PATH, index=False)
-    print(f"Method A candidates (α={alpha}): {len(df_out)} → {A_CANDIDATES_PATH}")
+    print(f"Method A candidates (FDR q<={q}): {len(df_out)} → {A_CANDIDATES_PATH}")
     return df_out
 
 
 # ── サブコマンド: method-a ────────────────────────────────────────────────────
+
+def _jaccard(a: set, b: set) -> float:
+    u = a | b
+    return len(a & b) / len(u) if u else 1.0
+
 
 def cmd_method_a(args: argparse.Namespace) -> None:
     download_nltk_data(with_stopwords=True)
@@ -521,48 +605,51 @@ def cmd_method_a(args: argparse.Namespace) -> None:
         df_stats = load_or_build_stats(
             force_build=False, workers=args.workers, batch_size=args.batch_size)
     else:
-        print("Building stats cache (α≤0.10) ...")
+        print("Building stats cache (FDR) ...")
         df_stats = build_stats_cache(workers=args.workers, batch_size=args.batch_size)
 
-    if args.filter:
-        alpha = args.filter
-        df_out = add_alpha_tier_column(filter_at_alpha(df_stats, alpha))
-        label = str(alpha).replace(".", "")
-        out_path = DATA_DIR / f"03_method_a_alpha{label}.csv"
+    if args.filter is not None:
+        q = args.filter
+        df_out = add_alpha_tier_column(select_significant(df_stats, q))
+        label = str(q).replace(".", "")
+        out_path = DATA_DIR / f"03_method_a_q{label}.csv"
         df_out.to_csv(out_path, index=False)
-        print(f"\nα={alpha} → {len(df_out)} candidates")
+        print(f"\nFDR q<={q} → {len(df_out)} candidates")
         print(df_out.head(20).to_string(index=False))
         print(f"\nSaved → {out_path}")
         return
 
     if args.compare:
-        print(f"\n{'═'*60}")
-        print("  Alpha comparison  (no recomputation – using saved stats)")
-        print(f"{'═'*60}")
-        base_n = len(filter_at_alpha(df_stats, 0.05))
-        rows_cmp: list[dict] = []
+        # 感度分析: 主基準 q=0.05 に対し q=0.01/0.10 で候補集合がどれだけ動くか
+        print(f"\n{'═'*64}")
+        print("  Sensitivity analysis — FDR q ∈ {0.01, 0.05, 0.10}")
+        print("  (主解析 q=0.05。0.01/0.10 で結論が頑健かを確認する)")
+        print(f"{'═'*64}")
         sets: dict[float, set[str]] = {}
-        for alpha in COMPARE_ALPHAS:
-            df_pass = filter_at_alpha(df_stats, alpha)
-            sets[alpha] = set(df_pass["token"])
-            diff = len(df_pass) - base_n
+        for q in COMPARE_ALPHAS:
+            sets[q] = set(select_significant(df_stats, q)["token"])
+        base = sets[DEFAULT_Q]
+        rows_cmp: list[dict] = []
+        for q in COMPARE_ALPHAS:
             rows_cmp.append({
-                "alpha":      f"α={alpha}",
-                "candidates": len(df_pass),
-                "vs α=0.05":  f"{diff:+d}",
+                "q":            f"q={q}",
+                "candidates":   len(sets[q]),
+                "vs q=0.05":    f"{len(sets[q]) - len(base):+d}",
+                "Jaccard(0.05)": f"{_jaccard(sets[q], base):.3f}",
             })
         print(pd.DataFrame(rows_cmp).to_string(index=False))
-        print(f"\n  Tokens in α=0.01 only : {len(sets[0.01])}")
-        print(f"  Added at α=0.05       : {len(sets[0.05] - sets[0.01])}  "
-              f"→ {sorted(sets[0.05] - sets[0.01])}")
-        print(f"  Added at α=0.10       : {len(sets[0.10] - sets[0.05])}  "
-              f"→ {sorted(sets[0.10] - sets[0.05])}")
+        print(f"\n  q=0.01 のみ採用       : {len(sets[0.01])}")
+        print(f"  q=0.05 で追加         : {len(sets[0.05] - sets[0.01])}  "
+              f"→ {sorted(sets[0.05] - sets[0.01])[:30]}")
+        print(f"  q=0.10 で追加         : {len(sets[0.10] - sets[0.05])}  "
+              f"→ {sorted(sets[0.10] - sets[0.05])[:30]}")
+        print("\n  解釈: Jaccard が高い(≈1)ほど閾値に頑健。低ければ q の選択が結果を左右する。")
         return
 
-    alpha = args.alpha
-    df_out = add_alpha_tier_column(filter_at_alpha(df_stats, alpha))
+    q = args.q
+    df_out = add_alpha_tier_column(select_significant(df_stats, q))
     df_out.to_csv(A_CANDIDATES_PATH, index=False)
-    print(f"\nCandidates found (α={alpha}) : {len(df_out)}")
+    print(f"\nCandidates found (FDR q<={q}) : {len(df_out)}")
     print(df_out.head(20).to_string(index=False))
     print(f"\nSaved → {A_CANDIDATES_PATH}")
 
@@ -713,11 +800,14 @@ def load_candidates_with_tier(
             tokens.add(token)
 
             tier = str(row.get("alpha_tier", "") or "").strip()
-            if not tier:  # alpha_tier 列が無い古い CSV からの復元
+            if not tier:  # alpha_tier 列が無い CSV からの復元(q_value 優先)
                 try:
-                    tier = compute_alpha_tier(
-                        float(row["p_value"]), int(float(row["n_tokens"]))
-                    ) or ""
+                    if row.get("q_value") not in (None, ""):
+                        tier = compute_q_tier(float(row["q_value"])) or ""
+                    else:
+                        tier = compute_alpha_tier(
+                            float(row["p_value"]), int(float(row["n_tokens"]))
+                        ) or ""
                 except (KeyError, ValueError, TypeError):
                     tier = ""
             if tier:
@@ -979,20 +1069,38 @@ def export_set_probabilities(
     return set_types
 
 
+def _llr_2x2(n11: float, n12: float, n21: float, n22: float) -> float:
+    """2x2 分割表の対数尤度比 G²(Dunning 1993)。漸近的に χ²(df=1)。"""
+    n = n11 + n12 + n21 + n22
+    if n <= 0:
+        return 0.0
+    r1, r2 = n11 + n12, n21 + n22
+    c1, c2 = n11 + n21, n12 + n22
+    g = 0.0
+    for obs, ri, cj in ((n11, r1, c1), (n12, r1, c2), (n21, r2, c1), (n22, r2, c2)):
+        e = ri * cj / n
+        if obs > 0 and e > 0:
+            g += obs * math.log(obs / e)
+    return 2.0 * g
+
+
 def export_pairs(
     conn: sqlite3.Connection,
     total_units: int,
     output_path: Path,
     min_pair_count: int,
     token_tier: Optional[dict[str, str]] = None,
+    pair_q: float = DEFAULT_Q,
 ) -> int:
-    """phrase ペアの共起回数 + PMI を出力する(案B)。
+    """phrase ペアの共起 + PMI + G²/FDR を出力する(案B + 層3)。
 
-    phrase_occ(p) と pair_occ(a,b) を GROUP BY して集計。co_count>=min_pair_count のみ出力。
+    phrase_occ(p)/pair_occ(a,b) を GROUP BY 集計。min_pair_count は計算量の事前足切り。
+    各ペアに 2x2 分割表の G²(Dunning)→ χ²(df=1) 片側 p 値 → BH-FDR の q 値を付与。
+    pair_q>0 のとき「q<=pair_q かつ 正の関連(観測>期待)」のみ出力(層3の本選別)。
     PMI = log2( co_count * N / (count_a * count_b) )、N=total_units。
     """
     token_tier = token_tier or {}
-    # 単独 phrase 出現数(=その phrase を含む単位数)
+    N = total_units
     conn.execute("DROP TABLE IF EXISTS phrase_counts;")
     conn.execute("CREATE TABLE phrase_counts AS SELECT p, COUNT(*) AS c FROM phrase_occ GROUP BY p")
     conn.commit()
@@ -1000,29 +1108,49 @@ def export_pairs(
 
     conn.execute("DROP TABLE IF EXISTS pair_counts;")
     conn.execute("CREATE TABLE pair_counts AS SELECT a, b, COUNT(*) AS c FROM pair_occ GROUP BY a, b")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pair_c ON pair_counts(c DESC);")
     conn.commit()
 
+    # 1パス目: 事前足切りを通ったペアの統計(G², 片側p値, 正の関連か)を集める
+    recs: list[tuple] = []     # (a, b, co, ca, cb, pmi, g2, positive)
+    pvals: list[float] = []
+    for a, b, co in conn.execute(
+        "SELECT a, b, c FROM pair_counts WHERE c >= ?", (min_pair_count,)
+    ):
+        ca = phrase_count.get(a, 0)
+        cb = phrase_count.get(b, 0)
+        n11 = co
+        n12 = ca - co
+        n21 = cb - co
+        n22 = N - ca - cb + co
+        e11 = (ca * cb / N) if N > 0 else 0.0
+        positive = n11 > e11
+        g2 = _llr_2x2(n11, n12, n21, n22)
+        # χ²(df=1) 両側 p を方向で片側化(正なら p/2、負なら 1-p/2)
+        p_two = float(chi2.sf(g2, 1))
+        p_one = (p_two / 2.0) if positive else (1.0 - p_two / 2.0)
+        pmi = math.log2((co * N) / (ca * cb)) if (N > 0 and ca > 0 and cb > 0) else 0.0
+        recs.append((a, b, co, ca, cb, pmi, g2, positive))
+        pvals.append(p_one)
+
+    qvals = bh_qvalues(pvals)  # 足切り後のペア集合上で BH-FDR
+
+    # 2パス目: q でフィルタしつつ書き出し(co_count 降順)
+    order = sorted(range(len(recs)), key=lambda i: (-recs[i][2], recs[i][0], recs[i][1]))
     n_pairs = 0
     with output_path.open("w", encoding="utf-8", newline="") as fw:
         writer = csv.writer(fw)
         writer.writerow([
             "phrase_a", "phrase_b", "co_count", "count_a", "count_b",
-            "probability", "pmi", "tier_a", "tier_b",
+            "probability", "pmi", "g2", "q_value", "tier_a", "tier_b",
         ])
-        for a, b, c in conn.execute(
-            "SELECT a, b, c FROM pair_counts WHERE c >= ? ORDER BY c DESC, a ASC, b ASC",
-            (min_pair_count,),
-        ):
-            ca = phrase_count.get(a, 0)
-            cb = phrase_count.get(b, 0)
-            prob = c / total_units if total_units > 0 else 0.0
-            if total_units > 0 and ca > 0 and cb > 0:
-                pmi = math.log2((c * total_units) / (ca * cb))
-            else:
-                pmi = 0.0
+        for i in order:
+            a, b, co, ca, cb, pmi, g2, positive = recs[i]
+            q = qvals[i]
+            if pair_q > 0 and not (positive and q <= pair_q):
+                continue
+            prob = co / N if N > 0 else 0.0
             writer.writerow([
-                a, b, c, ca, cb, prob, round(pmi, 4),
+                a, b, co, ca, cb, prob, round(pmi, 4), round(g2, 4), round(q, 6),
                 phrase_alpha_tier(a, token_tier) or "",
                 phrase_alpha_tier(b, token_tier) or "",
             ])
@@ -1155,6 +1283,7 @@ def run_cooccurrence(
             n_pairs = export_pairs(
                 conns[u], total_units=totals[u], output_path=pairs_path,
                 min_pair_count=args.min_pair_count, token_tier=token_tier,
+                pair_q=args.pair_q,
             )
         conns[u].close()
         results[u] = (totals[u], set_types, out_csv, n_pairs, pairs_path)
@@ -1166,19 +1295,28 @@ def run_cooccurrence(
         total, set_types, out_csv, n_pairs, pairs_path = results[u]
         print(f"  [{u:6s}] sets={total}  unique_sets={set_types}  → {out_csv}")
         if emit_pairs:
-            print(f"           pairs(co_count≥{args.min_pair_count})={n_pairs}  → {pairs_path}")
+            crit = (f"q≤{args.pair_q} & co_count≥{args.min_pair_count}"
+                    if args.pair_q > 0 else f"co_count≥{args.min_pair_count}")
+            print(f"           pairs({crit})={n_pairs}  → {pairs_path}")
     print(f"  detail(clause) → {detail_path}")
 
 
 # ── サブコマンド: cooccurrence ────────────────────────────────────────────────
 
 def cmd_cooccurrence(args: argparse.Namespace) -> None:
+    # 層1: 単語頻度 min(auto=オッズ比CI、候補CSVから算出)
+    min_freq_profile = resolve_min_freq_profile(
+        args.min_freq_profile, candidates_csv=args.candidates_csv)
     candidate_tokens, token_tier = load_candidates_with_tier(
         args.candidates_csv,
-        min_freq_profile=args.min_freq_profile,
+        min_freq_profile=min_freq_profile,
         min_effect_size=args.min_effect_size,
     )
-    allowed = load_allowed_phrases(args.method_b_csv, args.min_phrase_freq)
+    # 層2: フレーズ頻度 min(auto=2-fold 再現率)
+    min_phrase_freq = resolve_min_phrase_freq(
+        args.min_phrase_freq, candidate_tokens=candidate_tokens,
+        workers=resolve_workers(args.workers), batch_size=256)
+    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq)
     run_cooccurrence(args, candidate_tokens, token_tier, allowed)
 
 
@@ -1375,12 +1513,17 @@ def run_benchmark(
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
-    allowed = load_allowed_phrases(args.method_b_csv, args.min_phrase_freq)
+    min_freq_profile = resolve_min_freq_profile(
+        args.min_freq_profile, candidates_csv=args.candidates_csv)
     candidate_tokens, _ = load_candidates_with_tier(
         args.candidates_csv,
-        min_freq_profile=args.min_freq_profile,
+        min_freq_profile=min_freq_profile,
         min_effect_size=args.min_effect_size,
     )
+    min_phrase_freq = resolve_min_phrase_freq(
+        args.min_phrase_freq, candidate_tokens=candidate_tokens,
+        workers=resolve_workers(args.workers), batch_size=256)
+    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq)
     run_benchmark(args, candidate_tokens, allowed)
 
 
@@ -1388,15 +1531,17 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
 def cmd_all(args: argparse.Namespace) -> None:
     print("════ Stage 1/3: Method A ════")
-    df_a = compute_method_a(alpha=args.alpha, force_build=args.force_build,
+    df_a = compute_method_a(q=args.q, force_build=args.force_build,
                             workers=args.workers, batch_size=args.batch_size)
 
-    if args.min_freq_profile > 1 or args.min_effect_size > 1.0:
+    # 層1: 単語頻度 min を解決(auto = オッズ比CI下限>1 が target 割合を満たす最小頻度)
+    min_freq_profile = resolve_min_freq_profile(args.min_freq_profile, df_a)
+    if min_freq_profile > 1 or args.min_effect_size > 1.0:
         df_a = df_a[
-            (df_a["freq_profile"] >= args.min_freq_profile)
+            (df_a["freq_profile"] >= min_freq_profile)
             & (df_a["effect_size"] >= args.min_effect_size)
         ]
-        print(f"  filtered candidate tokens: {len(df_a)}")
+        print(f"  filtered candidate tokens (min_freq_profile={min_freq_profile}): {len(df_a)}")
 
     candidate_tokens: set[str] = set(df_a["token"].str.lower().tolist())
     token_tier = build_token_tier_map(df_a)
@@ -1405,13 +1550,213 @@ def cmd_all(args: argparse.Namespace) -> None:
     df_b = run_method_b(candidate_tokens, token_tier,
                         workers=args.workers, batch_size=args.batch_size)
 
+    # 層2: フレーズ頻度 min を解決(auto = 2-fold 再現率 ρ(r)>=target の最小 r)
+    min_phrase_freq = resolve_min_phrase_freq(
+        args.min_phrase_freq,
+        candidate_tokens=candidate_tokens, workers=args.workers, batch_size=args.batch_size,
+    )
     # 案1: Method B 辞書(正規化phrase + freq)を freq≥K で絞り共起の許可語彙にする
     allowed: Optional[set[str]] = None
-    if args.min_phrase_freq > 0 and not df_b.empty:
-        allowed = set(df_b[df_b["freq"] >= args.min_phrase_freq]["phrase"].astype(str))
+    if min_phrase_freq > 0 and not df_b.empty:
+        allowed = set(df_b[df_b["freq"] >= min_phrase_freq]["phrase"].astype(str))
 
     print("\n════ Stage 3/3: Record co-occurrence ════")
     run_cooccurrence(args, candidate_tokens, token_tier, allowed)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 頻度フィルタ閾値の選択アルゴリズム(層1: 単語 / 層2: フレーズ / 層3: ペア)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 層1 単語頻度  : オッズ比 95%CI 下限 > 1(Woolf)が target 割合を満たす最小頻度
+# 層2 フレーズ  : 2-fold 保留集合再現率 ρ(r) >= target を満たす最小頻度(Good-Turing)
+# 層3 ペア      : G²(尤度比検定, Dunning) + BH-FDR(export_pairs 内で適用)
+#
+# 層1/層2 は推奨整数を返し、--min-freq-profile/--min-phrase-freq の "auto" で解決する。
+# 層3 は整数ではなく有意性で切るため export_pairs の --pair-q で制御する。
+
+def odds_ratio_ci_lower(a: int, b: int, c: int, d: int, z: float = 1.96) -> float:
+    """オッズ比の (1-α) 信頼区間下限。Woolf 法 + Haldane-Anscombe 0.5 補正。
+
+    SE(lnOR) = sqrt(1/(a+.5)+1/(b+.5)+1/(c+.5)+1/(d+.5))、下限 = exp(lnOR - z·SE)。
+    """
+    a_, b_, c_, d_ = a + 0.5, b + 0.5, c + 0.5, d + 0.5
+    ln_or = math.log((a_ * d_) / (b_ * c_))
+    se = math.sqrt(1.0 / a_ + 1.0 / b_ + 1.0 / c_ + 1.0 / d_)
+    return math.exp(ln_or - z * se)
+
+
+def recommend_min_freq_profile(
+    df: pd.DataFrame, z: float = 1.96, target: float = 0.95, max_k: int = 30,
+) -> tuple[int, list[tuple[int, int, float]]]:
+    """層1: オッズ比CI下限>1 を満たすトークン割合が target 以上になる最小 freq を返す。
+
+    返り値: (推奨 K, [(K, 該当トークン数, CI下限>1 の割合), ...])。
+    df は freq_profile/freq_none/n_profile/n_none 列を要する(FDR版 method-a の出力)。
+    """
+    need = {"freq_profile", "freq_none", "n_profile", "n_none"}
+    if not need.issubset(df.columns):
+        raise ValueError(
+            "min-freq-profile auto には n_profile/n_none 列が必要です。"
+            "FDR版 method-a を再実行して 03_method_a_candidates.csv を作り直してください。"
+        )
+    a = df["freq_profile"].astype(int).tolist()
+    c = df["freq_none"].astype(int).tolist()
+    npf = df["n_profile"].astype(int).tolist()
+    nnn = df["n_none"].astype(int).tolist()
+    lowers = [
+        odds_ratio_ci_lower(ai, npf_i - ai, ci, nnn_i - ci, z)
+        for ai, ci, npf_i, nnn_i in zip(a, c, npf, nnn)
+    ]
+    table: list[tuple[int, int, float]] = []
+    rec: Optional[int] = None
+    for k in range(1, max_k + 1):
+        idx = [i for i, ai in enumerate(a) if ai >= k]
+        if not idx:
+            break
+        passrate = sum(1 for i in idx if lowers[i] > 1.0) / len(idx)
+        table.append((k, len(idx), passrate))
+        if rec is None and passrate >= target:
+            rec = k
+    if rec is None:
+        rec = table[-1][0] if table else 1
+    return rec, table
+
+
+def resolve_min_freq_profile(
+    value, df: Optional[pd.DataFrame] = None, candidates_csv: Optional[Path] = None,
+) -> int:
+    """--min-freq-profile の値(int または "auto")を整数へ解決する。"""
+    s = str(value).strip().lower()
+    if s != "auto":
+        return int(float(s))
+    if df is None:
+        df = pd.read_csv(candidates_csv)
+    rec, table = recommend_min_freq_profile(df)
+    print(f"[auto:層1] min-freq-profile = {rec}  "
+          f"(OR 95%CI下限>1 の割合 ≥ 0.95 となる最小頻度)")
+    for k, n, pr in table[:rec + 2]:
+        print(f"          freq≥{k:2d}: tokens={n:5d}  CI下限>1の割合={pr:.3f}")
+    return rec
+
+
+def _phrase_freq_for_clauses(
+    clauses: list[str], candidate_tokens: set[str], workers: int, batch_size: int, desc: str,
+) -> Counter:
+    """節リストへ Method B の NP 抽出を適用し、正規化phrase の頻度 Counter を返す。"""
+    results = parallel_map(
+        _mb_batch, chunked(clauses, batch_size), workers,
+        desc=desc, init_fn=_mb_init, init_args=(sorted(candidate_tokens),),
+    )
+    freq: Counter = Counter()
+    for f, _h, _ex in results:
+        freq.update(f)
+    return freq
+
+
+def recommend_min_phrase_freq(
+    candidate_tokens: set[str], workers: int = 1, batch_size: int = 256,
+    target: float = 0.5, seed: int = 42, max_k: int = 30,
+) -> tuple[int, list[tuple[int, int, float]]]:
+    """層2: 2-fold 保留集合再現率 ρ(K) >= target を満たす最小頻度 K を返す。
+
+    PROFILE 節を2分割し、片側で「頻度 >= K」のフレーズが他方にも出現する累積割合
+    ρ(K) を測る(両方向を合算)。ρ(K) は K について単調増加で、許可語彙が freq>=K で
+    切られる挙動と一致する。返り値: (推奨 K*, [(K, 該当フレーズ数, ρ(K)), ...])。
+    """
+    download_nltk_data()
+    df_clauses = read_labeled_clauses(LABELED_CLAUSES_PATH)
+    profile = df_clauses[df_clauses["label"] == "PROFILE"]["clause"].astype(str).tolist()
+    rng = random.Random(seed)
+    rng.shuffle(profile)
+    mid = len(profile) // 2
+    fold_a, fold_b = profile[:mid], profile[mid:]
+    print(f"[auto:層2] 2-fold 再現率: PROFILE節 {len(profile)} を {len(fold_a)}/{len(fold_b)} に分割")
+    freq_a = _phrase_freq_for_clauses(fold_a, candidate_tokens, workers, batch_size, "  fold A")
+    freq_b = _phrase_freq_for_clauses(fold_b, candidate_tokens, workers, batch_size, "  fold B")
+
+    table: list[tuple[int, int, float]] = []
+    rec: Optional[int] = None
+    for k in range(1, max_k + 1):
+        # 「頻度>=K」のフレーズが他方に出る累積割合(両方向を合算)
+        a_ge = [p for p, ct in freq_a.items() if ct >= k]
+        b_ge = [p for p, ct in freq_b.items() if ct >= k]
+        n = len(a_ge) + len(b_ge)
+        if n == 0:
+            table.append((k, 0, float("nan")))
+            continue
+        hit = sum(1 for p in a_ge if p in freq_b) + sum(1 for p in b_ge if p in freq_a)
+        rho = hit / n
+        table.append((k, n, rho))
+        if rec is None and rho >= target:
+            rec = k
+    if rec is None:
+        rec = max_k
+    return rec, table
+
+
+def resolve_min_phrase_freq(
+    value, candidate_tokens: Optional[set[str]] = None,
+    workers: int = 1, batch_size: int = 256,
+) -> int:
+    """--min-phrase-freq の値(int または "auto")を整数へ解決する。"""
+    s = str(value).strip().lower()
+    if s != "auto":
+        return int(float(s))
+    if candidate_tokens is None:
+        candidate_tokens, _ = load_candidates_with_tier(A_CANDIDATES_PATH)
+    rec, table = recommend_min_phrase_freq(candidate_tokens, workers, batch_size)
+    print(f"[auto:層2] min-phrase-freq = {rec}  (2-fold 累積再現率 ρ(K) ≥ 0.5 となる最小頻度)")
+    for k, n, rho in table[:rec + 2]:
+        rho_s = "  n/a" if rho != rho else f"{rho:.3f}"  # nan チェック
+        print(f"          freq≥{k:2d}: phrases={n:6d}  再現率ρ={rho_s}")
+    return rec
+
+
+def cmd_select_thresholds(args: argparse.Namespace) -> None:
+    """3層の頻度フィルタ閾値を学術的基準で推奨する(層1/層2を実測、層3は方針提示)。"""
+    workers = resolve_workers(args.workers)
+    print("=" * 64)
+    print("  頻度フィルタ閾値の選択(学術的基準)")
+    print("=" * 64)
+
+    # 層1: 単語頻度(オッズ比CI)
+    df_a = pd.read_csv(args.candidates_csv)
+    rec1, t1 = recommend_min_freq_profile(df_a, target=args.ci_target)
+    print(f"\n[層1] 単語頻度 min-freq-profile = {rec1}")
+    print(f"      基準: オッズ比95%CI下限>1 のトークン割合 ≥ {args.ci_target}(Woolf)")
+    for k, n, pr in t1[:rec1 + 3]:
+        mark = " ←推奨" if k == rec1 else ""
+        print(f"        freq≥{k:2d}: tokens={n:5d}  CI下限>1割合={pr:.3f}{mark}")
+
+    # 層2: フレーズ頻度(2-fold 再現率)
+    if not args.no_layer2:
+        cand_tokens, _ = load_candidates_with_tier(
+            args.candidates_csv, min_freq_profile=rec1, min_effect_size=args.min_effect_size)
+        rec2, t2 = recommend_min_phrase_freq(
+            cand_tokens, workers=workers, batch_size=args.batch_size, target=args.rho_target)
+        print(f"\n[層2] フレーズ頻度 min-phrase-freq = {rec2}")
+        print(f"      基準: 2-fold 累積保留集合再現率 ρ(K) ≥ {args.rho_target}(Good-Turing)")
+        for k, n, rho in t2[:rec2 + 3]:
+            rho_s = "  n/a" if rho != rho else f"{rho:.3f}"
+            mark = " ←推奨" if k == rec2 else ""
+            print(f"        freq≥{k:2d}: phrases={n:6d}  再現率ρ={rho_s}{mark}")
+    else:
+        rec2 = None
+        print("\n[層2] スキップ(--no-layer2)")
+
+    # 層3: ペア(G²+FDR の方針)
+    print(f"\n[層3] ペア共起 --min-pair-count は計算量の事前足切りのみ。")
+    print(f"      本選別は cooccurrence --pair-q {args.pair_q}(G² 尤度比検定 + BH-FDR)で行う。")
+    print(f"      → 偶然共起を有意性で除くため、整数閾値の最適化は不要。")
+
+    print("\n" + "=" * 64)
+    print("  推奨コマンド例:")
+    rec2_disp = rec2 if rec2 is not None else "auto"
+    print(f"    python qpii_pipeline.py cooccurrence \\")
+    print(f"        --min-freq-profile {rec1} --min-phrase-freq {rec2_disp} "
+          f"--pair-q {args.pair_q}")
+    print("=" * 64)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1429,15 +1774,16 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
     if with_candidates_csv:
         p.add_argument("--candidates-csv", type=Path, default=A_CANDIDATES_PATH,
                        help="Method A の候補トークン CSV")
-    p.add_argument("--min-freq-profile", type=int, default=1,
-                   help="候補トークンの最小 freq_profile")
+    p.add_argument("--min-freq-profile", type=str, default="1",
+                   help="層1 単語頻度フィルタ: 候補トークンの最小 freq_profile。"
+                        "整数 or 'auto'(オッズ比95%%CI下限>1 が95%%を満たす最小頻度)")
     p.add_argument("--min-effect-size", type=float, default=1.0,
                    help="候補トークンの最小 effect_size (odds ratio)")
     p.add_argument("--drop-single-word", action="store_true",
                    help="1語の表現を除外する(04 の最終出力と同じ挙動)")
-    p.add_argument("--min-phrase-freq", type=int, default=MIN_PHRASE_FREQ,
-                   help="案1 頻度フィルタ: Method B 辞書で freq≥K の phrase のみ共起に採用。"
-                        "0でフィルタ無効(自由NP)")
+    p.add_argument("--min-phrase-freq", type=str, default=str(MIN_PHRASE_FREQ),
+                   help="層2 フレーズ頻度フィルタ(案1): Method B 辞書で freq≥K の phrase のみ採用。"
+                        "整数 or 'auto'(2-fold 再現率 ρ(r)>=0.5 の最小頻度)。0でフィルタ無効")
     p.add_argument("--method-b-csv", type=Path, default=B_CANDIDATES_PATH,
                    help="許可フレーズ語彙に使う Method B 辞書 CSV")
     p.add_argument("--input", type=Path, default=LABELED_CLAUSES_PATH,
@@ -1456,7 +1802,10 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
     p.add_argument("--pairs", action=argparse.BooleanOptionalAction, default=True,
                    help="案B: phrase ペアの共起(co_count+PMI)も出力する。--no-pairs で無効")
     p.add_argument("--min-pair-count", type=int, default=2,
-                   help="ペア出力の最小共起回数(これ未満のペアは出力しない=裾の間引き)")
+                   help="層3 ペアの事前足切り: 共起回数がこれ未満のペアは出力しない(計算量制御)")
+    p.add_argument("--pair-q", type=float, default=DEFAULT_Q,
+                   help="層3 ペアの本選別: G²尤度比検定+BH-FDR の q 値がこれ以下かつ正の関連の"
+                        "ペアのみ出力。0以下でFDR無効(min-pair-countのみ)")
     p.add_argument("--out-prefix", type=Path, default=COOC_OUT_PREFIX,
                    help="出力接頭辞。<prefix>_<unit>_set_probabilities.csv 等を生成")
     p.add_argument("--sqlite-insert-buffer", type=int, default=20000,
@@ -1470,14 +1819,13 @@ def parse_args() -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command")
 
     # method-a
-    pa = sub.add_parser("method-a", help="形態素ベースの統計抽出で候補トークンを得る")
-    pa.add_argument("--alpha", type=float, default=ALPHA,
-                    help="候補トークンの有意水準(既定 config.ALPHA)。"
-                         "3階層すべてを得たい場合は 0.10 を指定。")
-    pa.add_argument("--filter", type=float, metavar="ALPHA",
-                    help="保存済み統計から指定 alpha で再フィルタ(再計算なし)")
+    pa = sub.add_parser("method-a", help="形態素ベースの統計抽出で候補トークンを得る(FDR)")
+    pa.add_argument("--q", type=float, default=DEFAULT_Q,
+                    help="FDR(Benjamini-Hochberg)の q 値しきい値(既定 0.05=主解析)")
+    pa.add_argument("--filter", type=float, metavar="Q",
+                    help="保存済み統計から指定 q で再フィルタ(再計算なし)")
     pa.add_argument("--compare", action="store_true",
-                    help="α=0.01/0.05/0.10 の比較表を出力(保存済み統計を使用)")
+                    help="感度分析: q=0.01/0.05/0.10 で候補集合の変動と Jaccard を出力")
     _add_ab_parallel_args(pa)
     pa.set_defaults(func=cmd_method_a)
 
@@ -1503,13 +1851,32 @@ def parse_args() -> argparse.Namespace:
 
     # all
     pall = sub.add_parser("all", help="method-a → method-b → cooccurrence を一気通貫で実行")
-    pall.add_argument("--alpha", type=float, default=ALPHA, help="Method A の有意水準")
+    pall.add_argument("--q", type=float, default=DEFAULT_Q, help="Method A の FDR q 値しきい値")
     pall.add_argument("--force-build", action="store_true",
                       help="統計キャッシュを無視して Method A を再計算する")
     pall.add_argument("--batch-size", type=int, default=256,
                       help="Method A/B のワーカーへ渡す節/トークンのバッチサイズ")
     _add_cooccurrence_args(pall, with_candidates_csv=False)
     pall.set_defaults(func=cmd_all)
+
+    # select-thresholds(3層の頻度フィルタ閾値を学術的基準で推奨)
+    pst = sub.add_parser(
+        "select-thresholds",
+        help="層1単語/層2フレーズ/層3ペアの頻度フィルタ閾値を学術的基準で推奨する")
+    pst.add_argument("--candidates-csv", type=Path, default=A_CANDIDATES_PATH,
+                     help="Method A の候補トークン CSV(FDR版)")
+    pst.add_argument("--ci-target", type=float, default=0.95,
+                     help="層1: オッズ比CI下限>1 を満たすべきトークン割合(既定0.95)")
+    pst.add_argument("--rho-target", type=float, default=0.5,
+                     help="層2: 2-fold 再現率 ρ(r) のしきい値(既定0.5)")
+    pst.add_argument("--pair-q", type=float, default=DEFAULT_Q,
+                     help="層3: 推奨コマンドに載せる FDR q 値(既定0.05)")
+    pst.add_argument("--min-effect-size", type=float, default=1.0)
+    pst.add_argument("--no-layer2", action="store_true",
+                     help="層2(2-fold 再現率, 重い)をスキップする")
+    pst.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
+    pst.add_argument("--batch-size", type=int, default=256)
+    pst.set_defaults(func=cmd_select_thresholds)
 
     args = parser.parse_args()
     if args.command is None:

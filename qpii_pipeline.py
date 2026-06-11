@@ -30,6 +30,7 @@
   data/05_field_set_probabilities.csv   共起セット出現確率(field単位; field_count + ...)
   data/05_clause_set_probabilities.csv  共起セット出現確率(clause単位; clause_count + ...)
   data/05_<unit>_pairs.csv              phrase ペア共起(co_count/count_a/count_b/probability/pmi/tier)
+  data/06_uuid_combos.csv               レコード単位 QPII 組み合わせの部分含有率(頻出アイテムセット)
   (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
 単語の有意性は FDR(Benjamini-Hochberg)の q 値で判定する(主解析 q=0.05)。
@@ -52,6 +53,7 @@ alpha_tier は q 値が通過する最も厳しい水準("0.01"/"0.05"/"0.10")�
   python qpii_pipeline.py cooccurrence              # annotations_pred_usa.jsonl を全件集計
   python qpii_pipeline.py cooccurrence --min-freq-profile auto --min-phrase-freq auto
   python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
+  python qpii_pipeline.py combos --min-support 0.001 # uuid内QPII組み合わせ(k≥3)の部分含有率
   python qpii_pipeline.py all                        # 全ステージ
 """
 
@@ -93,6 +95,7 @@ A_STATS_PATH: Path        = DATA_DIR / "03_method_a_stats.csv"
 A_CANDIDATES_PATH: Path   = DATA_DIR / "03_method_a_candidates.csv"
 B_CANDIDATES_PATH: Path   = DATA_DIR / "04_method_b_candidates.csv"
 COOC_OUT_PREFIX: Path     = DATA_DIR / "05"   # <prefix>_<unit>_set_probabilities.csv 等
+COMBO_OUT_PATH: Path      = DATA_DIR / "06_uuid_combos.csv"  # 部分含有率(頻出アイテムセット)
 COOC_UNITS: tuple[str, ...] = ("uuid", "field", "clause")  # 共起セットの集計単位
 
 # Method A: 統計キャッシュを作る最も緩い閾値
@@ -1760,6 +1763,161 @@ def cmd_select_thresholds(args: argparse.Namespace) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 部分含有率: レコード(uuid)単位の QPII 組み合わせ(頻出アイテムセット)
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_uuid_sets(
+    sets_csv: Path,
+) -> tuple[list[tuple[frozenset, int]], int, dict[str, str]]:
+    """05_uuid_set_probabilities.csv を (集合, レコード数) のリストへ読み込む。
+
+    返り値: ([(frozenset(terms), count), ...], 総レコード数, phrase→tier)。
+    uuid 単位は 1 レコード=1 集合なので、総レコード数 = uuid_count 列の総和。
+    各行の count は「ちょうどその集合を持つレコード数」なので、ある組み合わせ C を
+    部分集合に含む全行の count を合算すれば「C を含むレコード数」になる。
+    """
+    df = pd.read_csv(sets_csv)
+    count_col = next((c for c in ("uuid_count", "text_count") if c in df.columns), None)
+    if count_col is None:
+        raise ValueError(
+            f"{sets_csv} に uuid_count 列がありません。"
+            "cooccurrence の uuid 単位出力(05_uuid_set_probabilities.csv)を指定してください。")
+    tiers_series = df["tiers_json"] if "tiers_json" in df.columns else [None] * len(df)
+    sets_counts: list[tuple[frozenset, int]] = []
+    tier_map: dict[str, str] = {}
+    for terms_json, tiers_json, cnt in zip(df["terms_json"], tiers_series, df[count_col]):
+        try:
+            terms = json.loads(terms_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not terms:
+            continue
+        sets_counts.append((frozenset(terms), int(cnt)))
+        if isinstance(tiers_json, str):
+            try:
+                for t, ti in zip(terms, json.loads(tiers_json)):
+                    if ti and t not in tier_map:
+                        tier_map[t] = ti
+            except json.JSONDecodeError:
+                pass
+    total_records = sum(c for _s, c in sets_counts)
+    return sets_counts, total_records, tier_map
+
+
+def mine_frequent_itemsets(
+    sets_counts: list[tuple[frozenset, int]],
+    min_support_count: int,
+    max_size: int = 0,
+) -> dict[frozenset, int]:
+    """Apriori で「部分集合として含む」レコード数(支持度)≥ min_support_count の
+    アイテムセットを列挙する。max_size=0 で頻出が尽きるまで探索する。
+
+    返り値: {frozenset(組み合わせ): その組み合わせを部分集合に含むレコード数}。
+    各レコード集合 S は自身の全部分集合に count を寄与する。
+    """
+    item_support: dict[str, int] = defaultdict(int)           # L1: 単一フレーズの支持度
+    for s, c in sets_counts:
+        for it in s:
+            item_support[it] += c
+    freq: dict[frozenset, int] = {
+        frozenset((it,)): sup for it, sup in item_support.items() if sup >= min_support_count
+    }
+    all_freq: dict[frozenset, int] = dict(freq)
+    freq1 = set(freq)                                          # 頻出 1-項目(レコード前処理用)
+
+    k = 1
+    while freq and (max_size == 0 or k < max_size):
+        k += 1
+        # Apriori-gen: 先頭 k-2 要素を共有する頻出 (k-1)-集合どうしを結合
+        prev_sorted = sorted(tuple(sorted(s)) for s in freq)
+        freq_prev = set(freq)
+        candidates: set[frozenset] = set()
+        for i in range(len(prev_sorted)):
+            a = prev_sorted[i]
+            for j in range(i + 1, len(prev_sorted)):
+                b = prev_sorted[j]
+                if a[: k - 2] != b[: k - 2]:
+                    break                                      # ソート済 → 接頭辞が変われば以降も不一致
+                cand = frozenset(a) | frozenset(b)
+                if len(cand) != k:
+                    continue
+                if all(frozenset(cand - {x}) in freq_prev for x in cand):  # 全 (k-1)-部分集合が頻出か
+                    candidates.add(cand)
+        if not candidates:
+            break
+        # 候補の支持度を数える(各レコードの頻出項目だけから k-組合せを列挙)
+        cand_support: dict[frozenset, int] = {c: 0 for c in candidates}
+        for s, cnt in sets_counts:
+            if len(s) < k:
+                continue
+            items = [it for it in s if frozenset((it,)) in freq1]
+            if len(items) < k:
+                continue
+            for combo in combinations(sorted(items), k):
+                fc = frozenset(combo)
+                if fc in cand_support:
+                    cand_support[fc] += cnt
+        freq = {c: sup for c, sup in cand_support.items() if sup >= min_support_count}
+        all_freq.update(freq)
+    return all_freq
+
+
+def cmd_combos(args: argparse.Namespace) -> None:
+    """レコード(uuid)単位で QPII 組み合わせの部分含有率を頻出アイテムセットとして算出する。"""
+    sets_counts, total_records, tier_map = load_uuid_sets(args.sets_csv)
+    if total_records == 0:
+        print("レコードがありません。")
+        return
+    ms = args.min_support                                     # <1 は割合、>=1 は絶対件数
+    if ms < 1.0:
+        min_count = max(1, math.ceil(ms * total_records))
+        sup_desc = f"{ms:.4g} ({min_count}/{total_records}件)"
+    else:
+        min_count = int(ms)
+        sup_desc = f"{min_count}件"
+
+    print("=" * 64)
+    print("  レコード(uuid)単位 QPII 組み合わせの部分含有率(頻出アイテムセット)")
+    print("=" * 64)
+    print(f"  総レコード数={total_records}  ユニーク集合={len(sets_counts)}  "
+          f"min-support={sup_desc}  size≥{args.min_size}"
+          + (f"  max-size={args.max_size}" if args.max_size else ""))
+
+    itemsets = mine_frequent_itemsets(sets_counts, min_count, max_size=args.max_size)
+
+    by_size: dict[int, int] = defaultdict(int)                # サイズ別頻出数(1,2 も文脈用に表示)
+    for fs in itemsets:
+        by_size[len(fs)] += 1
+    for sz in sorted(by_size):
+        tag = "  ←出力対象" if sz >= args.min_size else ""
+        print(f"    size={sz}: {by_size[sz]} 個{tag}")
+
+    rows = [
+        {"combo": sorted(fs), "size": len(fs), "support_count": sup,
+         "support_pct": sup / total_records}
+        for fs, sup in itemsets.items() if len(fs) >= args.min_size
+    ]
+    rows.sort(key=lambda r: (-r["support_count"], r["size"]))
+
+    with args.output.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["combo_json", "tiers_json", "size", "support_count", "support_pct"])
+        for r in rows:
+            tiers = [tier_map.get(t, "") for t in r["combo"]]
+            writer.writerow([
+                json.dumps(r["combo"], ensure_ascii=False),
+                json.dumps(tiers, ensure_ascii=False),
+                r["size"], r["support_count"], f"{r['support_pct']:.6f}",
+            ])
+    print(f"\n  size≥{args.min_size} の組み合わせ {len(rows)} 件 → {args.output}")
+    if rows:
+        print("\n  上位(部分含有レコード割合):")
+        for r in rows[: min(args.top, len(rows))]:
+            print(f"    {r['support_pct'] * 100:7.3f}%  (n={r['support_count']:>8})  "
+                  f"size={r['size']}  {r['combo']}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLI
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1877,6 +2035,23 @@ def parse_args() -> argparse.Namespace:
     pst.add_argument("--workers", type=int, default=0, help="0以下でCPUコア数")
     pst.add_argument("--batch-size", type=int, default=256)
     pst.set_defaults(func=cmd_select_thresholds)
+
+    # combos(レコード単位 QPII 組み合わせの部分含有率)
+    pco = sub.add_parser(
+        "combos",
+        help="uuid 単位で QPII 組み合わせ(k≥3)を部分集合に含むレコード割合を算出する")
+    pco.add_argument("--sets-csv", type=Path,
+                     default=DATA_DIR / "05_uuid_set_probabilities.csv",
+                     help="cooccurrence の uuid 集合出力 CSV(uuid_count 列が必要)")
+    pco.add_argument("--min-size", type=int, default=3,
+                     help="出力する組み合わせの最小サイズ(既定3)")
+    pco.add_argument("--max-size", type=int, default=0,
+                     help="探索する最大サイズ(0で頻出が尽きるまで)")
+    pco.add_argument("--min-support", type=float, default=0.001,
+                     help="最小支持度。<1で割合(既定0.001=0.1%%)、>=1で絶対レコード数")
+    pco.add_argument("--top", type=int, default=30, help="標準出力に表示する上位件数")
+    pco.add_argument("--output", type=Path, default=COMBO_OUT_PATH)
+    pco.set_defaults(func=cmd_combos)
 
     args = parser.parse_args()
     if args.command is None:

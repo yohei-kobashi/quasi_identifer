@@ -31,6 +31,11 @@
   data/05_clause_set_probabilities.csv  共起セット出現確率(clause単位; clause_count + ...)
   data/05_<unit>_pairs.csv              phrase ペア共起(co_count/count_a/count_b/probability/pmi/tier)
   data/06_uuid_combos.csv               レコード単位 QPII 組み合わせの部分含有率(頻出アイテムセット)
+  data/06_phrase_set_records.csv        phrase(タグ付き範囲=clause)集合の出現レコード数(risk-sets)
+  data/06_field_set_records.csv         field 集合の出現レコード数(risk-sets)
+  data/06_term_records.csv              単独語の出現レコード数(risk-sets; 特徴量 const_support 用)
+  data/06_risk_sets_meta.json           risk-sets のメタ(総レコード N など)
+  data/07_reid_samples.csv              再識別リスク学習データ(y_risk + LDS 重み + train/test)
   (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
 単語の有意性は FDR(Benjamini-Hochberg)の q 値で判定する(主解析 q=0.05)。
@@ -54,6 +59,8 @@ alpha_tier は q 値が通過する最も厳しい水準("0.01"/"0.05"/"0.10")�
   python qpii_pipeline.py cooccurrence --min-freq-profile auto --min-phrase-freq auto
   python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
   python qpii_pipeline.py combos --min-support 0.001 # uuid内QPII組み合わせ(k≥3)の部分含有率
+  python qpii_pipeline.py risk-sets                  # phrase/field 集合の出現レコード数(05明細から)
+  python qpii_pipeline.py sample-balanced            # 再識別リスクの LDS 重み付き学習データ(目的B; phrase-field源)
   python qpii_pipeline.py all                        # 全ステージ
 """
 
@@ -96,6 +103,11 @@ A_CANDIDATES_PATH: Path   = DATA_DIR / "03_method_a_candidates.csv"
 B_CANDIDATES_PATH: Path   = DATA_DIR / "04_method_b_candidates.csv"
 COOC_OUT_PREFIX: Path     = DATA_DIR / "05"   # <prefix>_<unit>_set_probabilities.csv 等
 COMBO_OUT_PATH: Path      = DATA_DIR / "06_uuid_combos.csv"  # 部分含有率(頻出アイテムセット)
+# risk-sets: clause(=タグ付き範囲=phrase) / field 単位の表現集合と「出現レコード数」
+PHRASE_SET_PATH: Path     = DATA_DIR / "06_phrase_set_records.csv"
+FIELD_SET_PATH: Path      = DATA_DIR / "06_field_set_records.csv"
+TERM_REC_PATH: Path       = DATA_DIR / "06_term_records.csv"
+RISK_SETS_META_PATH: Path = DATA_DIR / "06_risk_sets_meta.json"
 COOC_UNITS: tuple[str, ...] = ("uuid", "field", "clause")  # 共起セットの集計単位
 
 # Method A: 統計キャッシュを作る最も緩い閾値
@@ -1304,9 +1316,73 @@ def run_cooccurrence(
     print(f"  detail(clause) → {detail_path}")
 
 
+def resume_cooccurrence_export(
+    args: argparse.Namespace,
+    token_tier: Optional[dict[str, str]] = None,
+) -> None:
+    """ingestion 済みの既存 *_sets.sqlite3 を使い、export 段階だけ再開する。
+
+    sqlite を作り直さず開き、total_units を raw_sets から再計算して set確率 /
+    ペア共起 を再生成する(export 系は集計テーブルを DROP→CREATE するので冪等)。
+    --skip-set-prob で set確率 export をスキップ(完成済みの単位のペアのみ補完する用)。
+    """
+    download_nltk_data()
+    token_tier = augment_token_tier_with_lemmas(token_tier or {})
+    units = list(args.unit)
+    prefix = str(args.out_prefix)
+    emit_pairs = args.pairs
+    print(f"[export-only] 既存 sqlite から export 再開: units={units}  "
+          f"pairs={'on' if emit_pairs else 'off'}  skip_set_prob={args.skip_set_prob}")
+    for u in units:
+        db_path = Path(f"{prefix}_{u}_sets.sqlite3")
+        if not db_path.exists():
+            print(f"  [skip] {db_path.name} が無いので {u} をスキップ")
+            continue
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA synchronous=OFF;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-200000;")
+        total_units = int(conn.execute("SELECT COUNT(*) FROM raw_sets").fetchone()[0])
+        print(f"  [{u:6s}] total_units={total_units}  ({db_path.name})")
+        if not args.skip_set_prob:
+            out_csv = Path(f"{prefix}_{u}_set_probabilities.csv")
+            t0 = time.time()
+            set_types = export_set_probabilities(
+                conn, total_units=total_units, output_path=out_csv,
+                token_tier=token_tier, count_col=f"{u}_count",
+            )
+            print(f"          set確率: unique_sets={set_types}  "
+                  f"({time.time() - t0:.1f}s) → {out_csv}")
+        if emit_pairs:
+            pairs_path = Path(f"{prefix}_{u}_pairs.csv")
+            t0 = time.time()
+            n_pairs = export_pairs(
+                conn, total_units=total_units, output_path=pairs_path,
+                min_pair_count=args.min_pair_count, token_tier=token_tier,
+                pair_q=args.pair_q,
+            )
+            crit = (f"q≤{args.pair_q} & co_count≥{args.min_pair_count}"
+                    if args.pair_q > 0 else f"co_count≥{args.min_pair_count}")
+            print(f"          ペア({crit})={n_pairs}  ({time.time() - t0:.1f}s) → {pairs_path}")
+        conn.close()
+    print("[export-only] 完了")
+
+
 # ── サブコマンド: cooccurrence ────────────────────────────────────────────────
 
 def cmd_cooccurrence(args: argparse.Namespace) -> None:
+    if getattr(args, "export_only", False):
+        # ingestion 済みの sqlite から export だけ再開する。method-b/許可フレーズ(層2)は
+        # 不要で、tier 注釈用の token_tier だけ候補CSVから用意する。
+        min_freq_profile = resolve_min_freq_profile(
+            args.min_freq_profile, candidates_csv=args.candidates_csv)
+        _cand, token_tier = load_candidates_with_tier(
+            args.candidates_csv,
+            min_freq_profile=min_freq_profile,
+            min_effect_size=args.min_effect_size,
+        )
+        resume_cooccurrence_export(args, token_tier)
+        return
     # 層1: 単語頻度 min(auto=オッズ比CI、候補CSVから算出)
     min_freq_profile = resolve_min_freq_profile(
         args.min_freq_profile, candidates_csv=args.candidates_csv)
@@ -1918,6 +1994,466 @@ def cmd_combos(args: argparse.Namespace) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# risk-sets: phrase(=タグ付き範囲=clause) / field 単位の表現集合と出現レコード数
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 05_clause_matched_terms.jsonl(clause ごとに uuid/field/matched_terms を持ち、
+# レコード順に連続)を1パスで集計する。レコード単位で「そのレコード内に現れた集合」を
+# 重複排除してから +1 することで、出現回数(COUNT(*))ではなく出現レコード数
+# (COUNT(DISTINCT uuid))を厳密に得る。これにより support が 1〜N に分布し、
+# uuid 全体和集合のようにレコード数で頭打ちにならない(再識別リスク分布の学習用)。
+
+def _write_set_records(
+    path: Path, ctr: "Counter[str]", n_records: int, token_tier: dict[str, str],
+) -> None:
+    """{集合キー(JSON): 出現レコード数} を CSV 出力(record_count 降順)。"""
+    rows = sorted(ctr.items(), key=lambda kv: (-kv[1], kv[0]))
+    with path.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["terms_json", "tiers_json", "set_size", "record_count", "probability"])
+        for key, cnt in rows:
+            try:
+                terms = json.loads(key)
+            except json.JSONDecodeError:
+                continue
+            tiers = [phrase_alpha_tier(t, token_tier) or "" for t in terms]
+            p = (cnt / n_records) if n_records > 0 else 0.0
+            writer.writerow([
+                key, json.dumps(tiers, ensure_ascii=False), len(terms), cnt, f"{p:.8f}",
+            ])
+
+
+def cmd_risk_sets(args: argparse.Namespace) -> None:
+    """05_clause_matched_terms.jsonl から phrase/field 集合の出現レコード数を集計する。"""
+    detail = Path(args.detail)
+    if not detail.exists():
+        raise FileNotFoundError(
+            f"明細 JSONL が見つかりません: {detail}\n"
+            f"先に `python qpii_pipeline.py cooccurrence`(または all)を実行してください。")
+
+    download_nltk_data()
+    _, token_tier = load_candidates_with_tier(args.candidates_csv)
+    token_tier = augment_token_tier_with_lemmas(token_tier)  # 05 の tier 計算と整合
+
+    phrase_ctr: "Counter[str]" = Counter()   # clause(タグ付き範囲)単位の表現集合
+    field_ctr: "Counter[str]" = Counter()    # field 単位(同一レコード内 field の和集合)
+    term_ctr: "Counter[str]" = Counter()     # 単独語の出現レコード数(特徴量 const_support 用)
+    n_records = 0
+
+    cur_uuid: Any = _NO_UUID
+    rec_phrase: set[str] = set()              # レコード内に現れた phrase 集合(JSON キー)
+    rec_field_acc: dict[str, set] = {}        # field -> 表現の和集合
+    rec_terms: set[str] = set()               # レコード内の単独語
+
+    def flush_record() -> None:
+        nonlocal n_records
+        if cur_uuid is _NO_UUID:
+            return
+        n_records += 1                        # QPII が0件でもレコードは母集団 N に数える
+        for k in rec_phrase:
+            phrase_ctr[k] += 1
+        for ts in rec_field_acc.values():
+            if ts:
+                field_ctr[json.dumps(sorted(ts), ensure_ascii=False)] += 1
+        for t in rec_terms:
+            term_ctr[t] += 1
+
+    print("=" * 64)
+    print("  risk-sets: phrase/field 集合の出現レコード数を集計")
+    print("=" * 64)
+    print(f"  入力: {detail}")
+    started = time.time()
+    n_lines = 0
+    with detail.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            n_lines += 1
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            uuid = rec.get("uuid")
+            if uuid != cur_uuid:
+                flush_record()
+                cur_uuid = uuid
+                rec_phrase = set()
+                rec_field_acc = {}
+                rec_terms = set()
+            terms = rec.get("matched_terms") or []
+            if not terms:                     # 空マッチ clause は集合に寄与しない
+                continue
+            st = sorted(set(terms))
+            rec_phrase.add(json.dumps(st, ensure_ascii=False))
+            rec_field_acc.setdefault(rec.get("field"), set()).update(terms)
+            rec_terms.update(terms)
+            if args.progress_every > 0 and n_lines % args.progress_every == 0:
+                el = max(1e-9, time.time() - started)
+                print(f"[progress] lines={n_lines} records={n_records} "
+                      f"phrase_sets={len(phrase_ctr)} speed={n_lines / el:.0f} line/s")
+        flush_record()
+
+    N = n_records
+    if N == 0:
+        print("レコードがありません。")
+        return
+
+    _write_set_records(args.phrase_out, phrase_ctr, N, token_tier)
+    _write_set_records(args.field_out, field_ctr, N, token_tier)
+    with args.term_out.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["term", "tier", "record_count", "probability"])
+        for t, c in sorted(term_ctr.items(), key=lambda kv: (-kv[1], kv[0])):
+            writer.writerow([t, phrase_alpha_tier(t, token_tier) or "", c, f"{c / N:.8f}"])
+
+    meta = {
+        "N": N, "n_lines": n_lines,
+        "n_phrase_sets": len(phrase_ctr), "n_field_sets": len(field_ctr),
+        "n_terms": len(term_ctr),
+    }
+    args.meta_out.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"\n  N(総レコード)={N}  clause行={n_lines}")
+    print(f"  phrase集合(distinct)={len(phrase_ctr)} → {args.phrase_out}")
+    print(f"  field 集合(distinct)={len(field_ctr)} → {args.field_out}")
+    print(f"  単独語(distinct)    ={len(term_ctr)} → {args.term_out}")
+    print(f"  meta → {args.meta_out}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 再識別リスク学習データ: LDS 重み付きバランスサンプリング(目的B)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# 目的変数 Y = log10(N / support)  (N=総レコード数, support=匿名集合サイズ)。
+#   rare な QI ほど support 小 → Y 大(高リスク)。common/NONE は Y≈0(低リスク)。
+#   情報量(self-information)/IDF と整合し、全単位がレコード母集団基準で通約可能。
+# バランスは既定で LDS(Label Distribution Smoothing, Yang et al. ICML2021)に基づく
+#   密度逆数の標本重み lds_weight を付与する(部分抽出ではなく重み付けで均す)。
+
+REID_OUT_PATH: Path = DATA_DIR / "07_reid_samples.csv"
+
+
+def lds_weights(
+    y_values: list[float], n_bins: int = 50, sigma_bins: float = 2.0, clip: float = 10.0,
+) -> list[float]:
+    """LDS(Yang et al. 2021)による密度逆数の標本重み。平均1に正規化し clip 倍で頭打ち。
+
+    目的値を n_bins ビンに離散化→経験密度をガウス核で平滑化(Label Distribution
+    Smoothing)→各標本の重み = 1/平滑化密度。重い裾(高リスク稀少域)を相対的に重く扱う。
+    """
+    import numpy as np
+
+    y = np.asarray(y_values, dtype=float)
+    if y.size == 0:
+        return []
+    ymin, ymax = float(y.min()), float(y.max())
+    if ymax <= ymin:
+        return [1.0] * y.size
+    edges = np.linspace(ymin, ymax, n_bins + 1)
+    idx = np.clip(np.digitize(y, edges[1:-1]), 0, n_bins - 1)
+    counts = np.bincount(idx, minlength=n_bins).astype(float)
+    half = max(1, int(round(3 * sigma_bins)))                 # ガウス核(±3σ)
+    ks = np.arange(-half, half + 1, dtype=float)
+    kernel = np.exp(-(ks ** 2) / (2.0 * sigma_bins ** 2))
+    kernel /= kernel.sum()
+    smoothed = np.maximum(np.convolve(counts, kernel, mode="same"), 1e-12)
+    w = 1.0 / smoothed[idx]
+    w *= y.size / w.sum()                                     # 平均1
+    if clip and clip > 0:
+        w = np.clip(w, 1.0 / clip, clip)
+        w *= y.size / w.sum()
+    return w.tolist()
+
+
+def _reid_features(terms: list[str], item_support: dict[str, int]) -> dict:
+    """QI(フレーズ集合)から support 以外の予測特徴を作る(丸暗記でなく汎化用)。"""
+    lens = [len(t) for t in terms]
+    nwords = [len(t.split()) for t in terms]
+    cs = [item_support.get(t, 0) for t in terms]
+    return {
+        "char_len_max": max(lens),
+        "char_len_mean": round(sum(lens) / len(lens), 3),
+        "n_words_mean": round(sum(nwords) / len(nwords), 3),
+        "has_digit": int(any(ch.isdigit() for t in terms for ch in t)),
+        "const_support_min": min(cs) if cs else 0,
+        "const_support_mean": round(sum(cs) / len(cs), 3) if cs else 0.0,
+    }
+
+
+def _make_reid_sample(
+    terms: list[str], support: int, unit_type: str, N: int,
+    tier_map: dict[str, str], item_support: dict[str, int],
+    provenance: str = "PROFILE", risk_zero: bool = False,
+) -> dict:
+    support = max(1, int(support))
+    y = 0.0 if risk_zero else math.log10(N / support)
+    strict = strictest_tier(tier_map.get(t, "") for t in terms) or ""
+    s = {
+        "provenance": provenance, "unit_type": unit_type, "size": len(terms),
+        "qi_json": json.dumps(terms, ensure_ascii=False),
+        "support": support, "N": N, "y_risk": round(y, 6),
+        "tier_strictest": strict,
+    }
+    s.update(_reid_features(terms, item_support))
+    return s
+
+
+def _load_none_anchors(
+    stats_csv: Path, n_target: int, N: int, item_support: dict[str, int], seed: int,
+) -> list[dict]:
+    """NONE(非PII)アンカーを method-a 統計から採る。非有意(q大)かつ NONE 優勢な語。
+
+    y_risk=0(NONE は support に依らずリスク0)。運用で非PII入力も来る前提の零点アンカー。
+    """
+    if n_target <= 0 or not stats_csv.exists():
+        if n_target > 0:
+            print(f"  [none] {stats_csv} が無いため NONE アンカーをスキップ")
+        return []
+    df = pd.read_csv(stats_csv)
+    need = {"token", "q_value", "freq_profile", "freq_none"}
+    if not need.issubset(df.columns):
+        print(f"  [none] {stats_csv} に必要列が無いため NONE アンカーをスキップ")
+        return []
+    cand = df[(df["q_value"] > 0.5) & (df["freq_none"] >= df["freq_profile"])]
+    if cand.empty:
+        print("  [none] 条件(非有意 & NONE優勢)に合うトークンが無く NONE アンカーをスキップ")
+        return []
+    cand = cand.sample(n=min(n_target, len(cand)), random_state=seed)
+    out: list[dict] = []
+    for tok, fn in zip(cand["token"].astype(str), cand["freq_none"].astype(int)):
+        out.append(_make_reid_sample(
+            [tok], max(1, int(fn)), "phrase", N, {}, item_support,
+            provenance="NONE", risk_zero=True))
+    print(f"  [none] NONE アンカー {len(out)} 件(q>0.5 & freq_none≥freq_profile から抽出)")
+    return out
+
+
+def _assign_reid_split(
+    samples: list[dict], item_support: dict[str, int], test_frac: float, seed: int,
+) -> None:
+    """リーク回避: 各標本を「最もレアな構成フレーズ(最小support)」でグループ化し、
+
+    そのキーのハッシュで train/test を分ける。識別力を担うレア語が両 split に跨らない。
+    """
+    import hashlib
+
+    def group_key(terms: list[str]) -> str:
+        return min(terms, key=lambda t: (item_support.get(t, 0), t)) if terms else ""
+
+    thr = int(test_frac * 1000)
+    for s in samples:
+        terms = json.loads(s["qi_json"])
+        gk = group_key(terms)
+        h = int(hashlib.md5(f"{seed}:{gk}".encode()).hexdigest(), 16) % 1000
+        s["split"] = "test" if h < thr else "train"
+
+
+def _load_set_records(
+    path: Path,
+) -> tuple[list[tuple[list[str], int]], dict[str, str]]:
+    """06_*_set_records.csv を (集合, 出現レコード数) のリストと phrase→tier に読む。"""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"集合-レコード数 CSV が見つかりません: {path}\n"
+            f"先に `python qpii_pipeline.py risk-sets` を実行してください。")
+    df = pd.read_csv(path)
+    if "record_count" not in df.columns:
+        raise ValueError(f"{path} に record_count 列がありません(risk-sets の出力を指定してください)。")
+    tiers_series = df["tiers_json"] if "tiers_json" in df.columns else [None] * len(df)
+    out: list[tuple[list[str], int]] = []
+    tier_map: dict[str, str] = {}
+    for tj, tij, cnt in zip(df["terms_json"], tiers_series, df["record_count"]):
+        try:
+            terms = json.loads(tj)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not terms:
+            continue
+        out.append((sorted(terms), int(cnt)))
+        if isinstance(tij, str):
+            try:
+                for t, ti in zip(terms, json.loads(tij)):
+                    if ti and t not in tier_map:
+                        tier_map[t] = ti
+            except json.JSONDecodeError:
+                pass
+    return out, tier_map
+
+
+def _build_samples_phrase_field(
+    args: argparse.Namespace,
+) -> tuple[list[dict], dict[str, int], int, str]:
+    """risk-sets 出力(phrase/field 集合 + 単独語レコード数)から PROFILE サンプルを作る。
+
+    各 distinct 集合が1サンプル。support=出現レコード数 → y_risk=log10(N/support)。
+    uuid 全体和集合と違い phrase/field 集合は複数レコードに再出現するので support が散らばる。
+    """
+    # item_support(単独語の出現レコード数)+ tier を term_records から
+    tdf = pd.read_csv(args.term_records_csv)
+    item_support: dict[str, int] = {
+        str(t): int(c) for t, c in zip(tdf["term"], tdf["record_count"])
+    }
+    tier_map: dict[str, str] = {}
+    if "tier" in tdf.columns:
+        for t, ti in zip(tdf["term"].astype(str), tdf["tier"]):
+            if isinstance(ti, str) and ti:
+                tier_map.setdefault(t, ti)
+
+    # N(総レコード): meta 優先、無ければ probability から復元
+    N = 0
+    meta_path = Path(args.meta_json)
+    if meta_path.exists():
+        try:
+            N = int(json.loads(meta_path.read_text(encoding="utf-8")).get("N", 0))
+        except (ValueError, json.JSONDecodeError):
+            N = 0
+    if N <= 0 and "probability" in tdf.columns:
+        for c, p in zip(tdf["record_count"], tdf["probability"]):
+            if p and float(p) > 0:
+                N = int(round(int(c) / float(p)))
+                break
+
+    phrase_recs, tm1 = _load_set_records(args.phrase_sets_csv)
+    field_recs, tm2 = _load_set_records(args.field_sets_csv)
+    for src in (tm1, tm2):
+        for k, v in src.items():
+            tier_map.setdefault(k, v)
+
+    min_rc = max(1, args.min_record_count)
+    samples: list[dict] = []
+    for terms, cnt in phrase_recs:
+        if cnt >= min_rc:
+            samples.append(_make_reid_sample(terms, cnt, "phrase", N, tier_map, item_support))
+    n_phrase = len(samples)
+    for terms, cnt in field_recs:
+        if cnt >= min_rc:
+            samples.append(_make_reid_sample(terms, cnt, "field", N, tier_map, item_support))
+    info = f"phrase={n_phrase} field={len(samples) - n_phrase} (min_record_count={min_rc})"
+    return samples, item_support, N, info
+
+
+def _build_samples_uuid(
+    args: argparse.Namespace,
+) -> tuple[list[dict], dict[str, int], int, str]:
+    """(旧)uuid 全体和集合ソース。phrase=単独語 / combination=mining / record_set=完全集合。
+
+    全レコードが固有集合化し support がレコード数で頭打ちになるため比較用。
+    """
+    sets_counts, N, tier_map = load_uuid_sets(args.sets_csv)
+    item_support: dict[str, int] = defaultdict(int)
+    for s, c in sets_counts:
+        for it in s:
+            item_support[it] += c
+    samples: list[dict] = []
+    for ph, sup in item_support.items():
+        samples.append(_make_reid_sample([ph], sup, "phrase", N, tier_map, item_support))
+    n_phrase = len(samples)
+    n_combo = 0
+    if args.max_size >= 2:
+        itemsets = mine_frequent_itemsets(sets_counts, args.combo_min_support, max_size=args.max_size)
+        for fs, sup in itemsets.items():
+            if len(fs) >= 2:
+                samples.append(_make_reid_sample(
+                    sorted(fs), sup, "combination", N, tier_map, item_support))
+                n_combo += 1
+    n_rec = 0
+    if not args.no_record_sets:
+        for s, c in sets_counts:
+            samples.append(_make_reid_sample(
+                sorted(s), c, "record_set", N, tier_map, item_support))
+            n_rec += 1
+    info = f"phrase={n_phrase} combination={n_combo} record_set={n_rec}"
+    return samples, dict(item_support), N, info
+
+
+def cmd_sample_balanced(args: argparse.Namespace) -> None:
+    """目的B: 再識別リスク(y_risk=log10(N/support))の LDS 重み付きバランス学習データを作る。"""
+    import numpy as np
+
+    print("=" * 64)
+    print("  再識別リスク学習データ生成(目的B / LDS 重み付け)")
+    print("=" * 64)
+    if args.source == "uuid":
+        samples, item_support, N, info = _build_samples_uuid(args)
+    else:  # phrase-field(既定): risk-sets 出力を使用
+        samples, item_support, N, info = _build_samples_phrase_field(args)
+    if N <= 0 or not samples:
+        print("サンプルがありません(N=0 か集合0件)。入力 CSV を確認してください。")
+        return
+    print(f"  source={args.source}  N(総レコード)={N}  "
+          f"y_risk=log10(N/support) 最大={math.log10(N):.3f}")
+
+    # NONE アンカー(y_risk=0): 目的Bでは勾配を潰さぬよう少量のみ
+    n_profile = len(samples)
+    if args.none_fraction > 0:
+        f = min(0.9, args.none_fraction)
+        n_none_target = int(round(f / (1.0 - f) * n_profile))
+        samples += _load_none_anchors(args.stats_csv, n_none_target, N, item_support, args.seed)
+
+    print(f"  サンプル: {info}  NONE={len(samples) - n_profile}  計={len(samples)}")
+
+    # ── バランス化 ──────────────────────────────────────────────
+    ys = [s["y_risk"] for s in samples]
+    if args.balance_mode == "lds":
+        w = lds_weights(ys, args.lds_bins, args.lds_sigma, args.weight_clip)
+        for s, wi in zip(samples, w):
+            s["lds_weight"] = round(wi, 6)
+        # max-samples 指定時は重み比例の非復元抽出で物理的にも均す
+        if args.max_samples and 0 < args.max_samples < len(samples):
+            rng = np.random.default_rng(args.seed)
+            p = np.asarray(w, dtype=float); p = p / p.sum()
+            sel = rng.choice(len(samples), size=args.max_samples, replace=False, p=p)
+            samples = [samples[i] for i in sorted(sel.tolist())]
+            ys = [s["y_risk"] for s in samples]
+            w2 = lds_weights(ys, args.lds_bins, args.lds_sigma, args.weight_clip)
+            for s, wi in zip(samples, w2):
+                s["lds_weight"] = round(wi, 6)
+            print(f"  max-samples={args.max_samples}: 重み比例抽出で {len(samples)} 件に縮小")
+    else:  # bin-equal: 分位ビン等数抽出(従来法の比較用)。重みは一律1
+        order = sorted(range(len(samples)), key=lambda i: ys[i])
+        nb = max(1, args.lds_bins)
+        per = (args.max_samples // nb) if args.max_samples else None
+        bins = np.array_split(np.array(order), nb)
+        rng = np.random.default_rng(args.seed)
+        keep: list[int] = []
+        target = per if per else min(len(b) for b in bins if len(b) > 0)
+        for b in bins:
+            b = b.tolist()
+            if not b:
+                continue
+            k = min(target, len(b))
+            keep += rng.choice(b, size=k, replace=False).tolist()
+        samples = [samples[i] for i in sorted(keep)]
+        for s in samples:
+            s["lds_weight"] = 1.0
+        print(f"  bin-equal: {nb}ビン×{target}件 → {len(samples)} 件")
+
+    # ── train/test 分割(レア構成フレーズでグループ化しリーク回避)──
+    _assign_reid_split(samples, item_support, args.test_frac, args.seed)
+    n_test = sum(1 for s in samples if s["split"] == "test")
+
+    # ── 出力 ────────────────────────────────────────────────────
+    cols = [
+        "provenance", "unit_type", "size", "qi_json", "support", "N", "y_risk",
+        "lds_weight", "split", "tier_strictest",
+        "char_len_max", "char_len_mean", "n_words_mean", "has_digit",
+        "const_support_min", "const_support_mean",
+    ]
+    with args.output.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.DictWriter(fw, fieldnames=cols)
+        writer.writeheader()
+        for s in samples:
+            writer.writerow({c: s.get(c, "") for c in cols})
+
+    wvals = [s["lds_weight"] for s in samples]
+    print(f"\n  y_risk: min={min(ys):.3f} max={max(ys):.3f}")
+    print(f"  lds_weight: min={min(wvals):.3f} max={max(wvals):.3f} (平均≈1)")
+    print(f"  split: train={len(samples) - n_test}  test={n_test} (test_frac={args.test_frac})")
+    print(f"  → {len(samples)} 件 / {len(cols)} 列  → {args.output}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLI
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1968,6 +2504,12 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
                    help="出力接頭辞。<prefix>_<unit>_set_probabilities.csv 等を生成")
     p.add_argument("--sqlite-insert-buffer", type=int, default=20000,
                    help="SQLiteへ一括INSERTするバッファ行数")
+    p.add_argument("--export-only", action="store_true",
+                   help="ingestionをスキップし、既存 <prefix>_<unit>_sets.sqlite3 から "
+                        "set確率/ペアの export だけ再開する(再開モード)")
+    p.add_argument("--skip-set-prob", action="store_true",
+                   help="--export-only 時に set確率CSVをスキップしペアのみ再生成する"
+                        "(set確率が完成済みの単位用)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -2052,6 +2594,68 @@ def parse_args() -> argparse.Namespace:
     pco.add_argument("--top", type=int, default=30, help="標準出力に表示する上位件数")
     pco.add_argument("--output", type=Path, default=COMBO_OUT_PATH)
     pco.set_defaults(func=cmd_combos)
+
+    # risk-sets(phrase/field 単位の表現集合と「出現レコード数」を算出)
+    prs = sub.add_parser(
+        "risk-sets",
+        help="05_clause_matched_terms.jsonl から phrase/field 集合の出現レコード数を集計する")
+    prs.add_argument("--detail", type=Path,
+                     default=DATA_DIR / "05_clause_matched_terms.jsonl",
+                     help="cooccurrence の clause 明細 JSONL(uuid/field/matched_terms)")
+    prs.add_argument("--candidates-csv", type=Path, default=A_CANDIDATES_PATH,
+                     help="tier 付与に使う Method A 候補トークン CSV")
+    prs.add_argument("--phrase-out", type=Path, default=PHRASE_SET_PATH)
+    prs.add_argument("--field-out", type=Path, default=FIELD_SET_PATH)
+    prs.add_argument("--term-out", type=Path, default=TERM_REC_PATH)
+    prs.add_argument("--meta-out", type=Path, default=RISK_SETS_META_PATH)
+    prs.add_argument("--progress-every", type=int, default=1_000_000,
+                     help="進捗表示する明細行間隔(0で無効)")
+    prs.set_defaults(func=cmd_risk_sets)
+
+    # sample-balanced(目的B: 再識別リスクの LDS 重み付きバランス学習データ)
+    psb = sub.add_parser(
+        "sample-balanced",
+        help="再識別リスク y_risk=log10(N/support) の LDS 重み付きバランス学習データを作る")
+    psb.add_argument("--source", choices=["phrase-field", "uuid"], default="phrase-field",
+                     help="既定 phrase-field=risk-sets の phrase/field 集合(support が分布する)"
+                          " / uuid=旧 全体和集合(レコード数で頭打ち, 比較用)")
+    psb.add_argument("--phrase-sets-csv", type=Path, default=PHRASE_SET_PATH,
+                     help="[phrase-field] risk-sets の phrase 集合 CSV")
+    psb.add_argument("--field-sets-csv", type=Path, default=FIELD_SET_PATH,
+                     help="[phrase-field] risk-sets の field 集合 CSV")
+    psb.add_argument("--term-records-csv", type=Path, default=TERM_REC_PATH,
+                     help="[phrase-field] risk-sets の単独語レコード数 CSV(特徴量 const_support 用)")
+    psb.add_argument("--meta-json", type=Path, default=RISK_SETS_META_PATH,
+                     help="[phrase-field] risk-sets の meta(総レコード N)")
+    psb.add_argument("--min-record-count", type=int, default=1,
+                     help="[phrase-field] この出現レコード数未満の集合を除外(既定1=全件)")
+    psb.add_argument("--sets-csv", type=Path,
+                     default=DATA_DIR / "05_uuid_set_probabilities.csv",
+                     help="[uuid] 全体和集合 CSV(uuid_count 列が必要)")
+    psb.add_argument("--stats-csv", type=Path, default=A_STATS_PATH,
+                     help="NONE アンカー抽出元の method-a 統計 CSV")
+    psb.add_argument("--max-size", type=int, default=4,
+                     help="[uuid] 組み合わせ(size≥2)を探索する最大サイズ(既定4)")
+    psb.add_argument("--combo-min-support", type=int, default=2,
+                     help="[uuid] 組み合わせ mining の事前足切り(計算量制御, 既定2)")
+    psb.add_argument("--no-record-sets", action="store_true",
+                     help="[uuid] 観測レコード完全集合(k-匿名性等価クラス)を含めない")
+    psb.add_argument("--none-fraction", type=float, default=0.15,
+                     help="NONE(リスク0)アンカーの目標割合(既定0.15)。0で無効")
+    psb.add_argument("--balance-mode", choices=["lds", "bin-equal"], default="lds",
+                     help="既定 lds=密度逆数重み付け / bin-equal=分位ビン等数抽出")
+    psb.add_argument("--lds-bins", type=int, default=50, help="LDS/ビンの分割数")
+    psb.add_argument("--lds-sigma", type=float, default=2.0,
+                     help="LDS ガウス平滑核の σ(ビン単位)")
+    psb.add_argument("--weight-clip", type=float, default=10.0,
+                     help="lds_weight の頭打ち倍率(0で無効)")
+    psb.add_argument("--max-samples", type=int, default=0,
+                     help="出力上限(既定0=全件)。LDSは重みで分布を均すので通常は間引き不要。"
+                          "巨大すぎる場合のみ指定→lds は重み比例の非復元抽出で物理バランス化")
+    psb.add_argument("--test-frac", type=float, default=0.2, help="test 分割比率")
+    psb.add_argument("--seed", type=int, default=42)
+    psb.add_argument("--output", type=Path, default=REID_OUT_PATH)
+    psb.set_defaults(func=cmd_sample_balanced)
 
     args = parser.parse_args()
     if args.command is None:

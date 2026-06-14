@@ -2545,28 +2545,28 @@ def _iter_detail_clause_groups(
 def _join_clause_spans(
     original_path: Path, detail_path: Path, field_order: list[str],
 ) -> Iterable[tuple[str, str, list[str]]]:
-    """元 jsonl と detail jsonl を位置整合 join し (text, label, matched_terms) を yield。
+    """元 jsonl と detail jsonl を uuid キーで join し (text, label, matched_terms) を yield。
 
-    両ファイルとも uuid 連続・同順・同じ clause 集合(field in TEXT_FIELDS / 非空)である前提。
-    長さ不一致の uuid は安全のためスキップ(件数は呼び出し側で集計)。
+    detail は run_cooccurrence の imap_unordered により uuid 並びがシャッフルされている
+    (各 uuid 内の clause は連続・field_order 順)。よって順序前提の照合は不可。detail を
+    uuid→matched_terms 列の dict にインデックス化し、原文をストリームして位置整合 join する。
+    各 uuid 内は両者とも field in TEXT_FIELDS / 非空 clause / field_order 順で同一集合。
     """
-    orig = _iter_original_clause_groups(original_path, field_order)
-    o_uuid, o_seq = next(orig, (None, None))
+    detail_idx: dict[Any, list[list[str]]] = {}
+    for uuid, seq in _iter_detail_clause_groups(detail_path):
+        detail_idx[uuid] = [terms for (_field, terms) in seq]
+    print(f"  detail インデックス: uuid={len(detail_idx):,}")
+
     skipped = 0
-    for d_uuid, d_seq in _iter_detail_clause_groups(detail_path):
-        while o_uuid is not None and o_uuid != d_uuid:
-            o_uuid, o_seq = next(orig, (None, None))
-        if o_uuid is None:
-            break
-        if o_seq is None or len(o_seq) != len(d_seq):
+    for uuid, o_seq in _iter_original_clause_groups(original_path, field_order):
+        d_terms = detail_idx.get(uuid)
+        if d_terms is None or len(d_terms) != len(o_seq):
             skipped += 1
-            o_uuid, o_seq = next(orig, (None, None))
             continue
-        for (_of, text, label), (_df, terms) in zip(o_seq, d_seq):
+        for (_field, text, label), terms in zip(o_seq, d_terms):
             yield text, label, terms
-        o_uuid, o_seq = next(orig, (None, None))
     if skipped:
-        print(f"  [warn] clause 数不一致でスキップした uuid: {skipped}")
+        print(f"  [warn] detail と整合しない uuid をスキップ: {skipped:,}")
 
 
 def cmd_span_join(args: argparse.Namespace) -> None:

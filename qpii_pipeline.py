@@ -35,7 +35,9 @@
   data/06_field_set_records.csv         field 集合の出現レコード数(risk-sets)
   data/06_term_records.csv              単独語の出現レコード数(risk-sets; 特徴量 const_support 用)
   data/06_risk_sets_meta.json           risk-sets のメタ(総レコード N など)
+  data/06_span_records.csv              span(text/label/QI集合/freq)素材(span-join; 案2)
   data/07_reid_samples.csv              再識別リスク学習データ(y_risk + LDS 重み + train/test)
+                                        sample-spans 版は text 列(X=埋め込みの元)を含む
   (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
 単語の有意性は FDR(Benjamini-Hochberg)の q 値で判定する(主解析 q=0.05)。
@@ -60,7 +62,9 @@ alpha_tier は q 値が通過する最も厳しい水準("0.01"/"0.05"/"0.10")�
   python qpii_pipeline.py benchmark --test-rows 10000 --target-rows 1000000
   python qpii_pipeline.py combos --min-support 0.001 # uuid内QPII組み合わせ(k≥3)の部分含有率
   python qpii_pipeline.py risk-sets                  # phrase/field 集合の出現レコード数(05明細から)
-  python qpii_pipeline.py sample-balanced            # 再識別リスクの LDS 重み付き学習データ(目的B; phrase-field源)
+  python qpii_pipeline.py span-join                  # 案2: clause に text/label/QI集合を紐づけ
+  python qpii_pipeline.py sample-spans --max-support1 2000000 --max-none-empty 2000000
+  python qpii_pipeline.py sample-balanced            # (集合中心)再識別リスクの LDS 学習データ
   python qpii_pipeline.py all                        # 全ステージ
 """
 
@@ -108,6 +112,8 @@ PHRASE_SET_PATH: Path     = DATA_DIR / "06_phrase_set_records.csv"
 FIELD_SET_PATH: Path      = DATA_DIR / "06_field_set_records.csv"
 TERM_REC_PATH: Path       = DATA_DIR / "06_term_records.csv"
 RISK_SETS_META_PATH: Path = DATA_DIR / "06_risk_sets_meta.json"
+# span-join: タグ付き span(clause)に text/label/QI集合を紐づけた学習素材(案2)
+SPAN_REC_PATH: Path       = DATA_DIR / "06_span_records.csv"
 COOC_UNITS: tuple[str, ...] = ("uuid", "field", "clause")  # 共起セットの集計単位
 
 # Method A: 統計キャッシュを作る最も緩い閾値
@@ -2454,6 +2460,338 @@ def cmd_sample_balanced(args: argparse.Namespace) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# span-join + sample-spans: タグ付き span(text)中心の学習データ(案2)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# サンプル単位 = 元データでタグ付けされた clause(=span)。X はその text(後段で
+# BERT 等の埋め込みを別コードで取得)。y_risk は:
+#   PROFILE かつ QI 抽出あり → log10(N/support)  (support=その QI 集合の出現レコード数)
+#   NONE                      → 0                (非PII=リスク0。マッチ有はハードネガ)
+#   PROFILE かつ QI 抽出なし   → 除外(rarity 由来の y を付けられないため)
+# ラベル/テキストは元 annotations_pred_usa.jsonl、QI 集合(matched_terms)は
+# 05_clause_matched_terms.jsonl にあり、両者を (uuid→field順) の位置整合で join する
+# (NLTK 再抽出は不要)。span-join が distinct text 単位に集約して 06_span_records.csv を
+# 出力し、sample-spans が support 参照・バランス化して 07_reid_samples.csv を作る。
+
+
+def _iter_original_clause_groups(
+    path: Path, field_order: list[str],
+) -> Iterable[tuple[Any, list[tuple[str, str]]]]:
+    """元 jsonl を uuid 単位でまとめ、(uuid, [(field, text, label), ...]) を yield する。
+
+    iter_jsonl_record_tasks と同じ整列(field in TEXT_FIELDS / 非空 clause / field_order 順)
+    にして 05_clause_matched_terms.jsonl の clause 並びと一致させる。
+    """
+    field_set = set(field_order)
+    cur_uuid: Any = _NO_UUID
+    cur_fields: dict[str, list[tuple[str, str]]] = {}
+
+    def build() -> list[tuple[str, str, str]]:
+        return [(f, t, lab) for f in field_order for (t, lab) in cur_fields.get(f, [])]
+
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            uuid = rec.get("uuid")
+            if uuid != cur_uuid:
+                if cur_uuid is not _NO_UUID:
+                    seq = build()
+                    if seq:
+                        yield cur_uuid, seq
+                cur_uuid = uuid
+                cur_fields = {}
+            field = rec.get("field")
+            clause = rec.get("clause")
+            if field in field_set and clause:
+                cur_fields.setdefault(field, []).append((str(clause), str(rec.get("label"))))
+        if cur_uuid is not _NO_UUID:
+            seq = build()
+            if seq:
+                yield cur_uuid, seq
+
+
+def _iter_detail_clause_groups(
+    path: Path,
+) -> Iterable[tuple[Any, list[tuple[Any, list[str]]]]]:
+    """05_clause_matched_terms.jsonl を uuid 単位でまとめ (uuid, [(field, matched_terms),...])。"""
+    cur_uuid: Any = _NO_UUID
+    seq: list[tuple[Any, list[str]]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            uuid = rec.get("uuid")
+            if uuid != cur_uuid:
+                if cur_uuid is not _NO_UUID and seq:
+                    yield cur_uuid, seq
+                cur_uuid = uuid
+                seq = []
+            seq.append((rec.get("field"), rec.get("matched_terms") or []))
+        if cur_uuid is not _NO_UUID and seq:
+            yield cur_uuid, seq
+
+
+def _join_clause_spans(
+    original_path: Path, detail_path: Path, field_order: list[str],
+) -> Iterable[tuple[str, str, list[str]]]:
+    """元 jsonl と detail jsonl を位置整合 join し (text, label, matched_terms) を yield。
+
+    両ファイルとも uuid 連続・同順・同じ clause 集合(field in TEXT_FIELDS / 非空)である前提。
+    長さ不一致の uuid は安全のためスキップ(件数は呼び出し側で集計)。
+    """
+    orig = _iter_original_clause_groups(original_path, field_order)
+    o_uuid, o_seq = next(orig, (None, None))
+    skipped = 0
+    for d_uuid, d_seq in _iter_detail_clause_groups(detail_path):
+        while o_uuid is not None and o_uuid != d_uuid:
+            o_uuid, o_seq = next(orig, (None, None))
+        if o_uuid is None:
+            break
+        if o_seq is None or len(o_seq) != len(d_seq):
+            skipped += 1
+            o_uuid, o_seq = next(orig, (None, None))
+            continue
+        for (_of, text, label), (_df, terms) in zip(o_seq, d_seq):
+            yield text, label, terms
+        o_uuid, o_seq = next(orig, (None, None))
+    if skipped:
+        print(f"  [warn] clause 数不一致でスキップした uuid: {skipped}")
+
+
+def cmd_span_join(args: argparse.Namespace) -> None:
+    """元 jsonl × detail jsonl を join し、distinct text 単位の span 学習素材を作る。"""
+    original = Path(args.input)
+    detail = Path(args.detail)
+    for p in (original, detail):
+        if not p.exists():
+            raise FileNotFoundError(f"入力が見つかりません: {p}")
+
+    db_path = Path(args.work_db)
+    if db_path.exists():
+        db_path.unlink()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA cache_size=-200000;")
+    conn.execute("CREATE TABLE spans (text TEXT NOT NULL, label TEXT NOT NULL, qi_json TEXT NOT NULL);")
+    conn.commit()
+
+    print("=" * 64)
+    print("  span-join: clause(text/label/QI集合)を join して span 素材を作成")
+    print("=" * 64)
+    print(f"  元: {original}\n  detail: {detail}")
+
+    field_order = list(TEXT_FIELDS)
+    buf: list[tuple[str, str, str]] = []
+    n_clause = n_profile = n_none = 0
+    started = time.time()
+    for text, label, terms in _join_clause_spans(original, detail, field_order):
+        qi = json.dumps(sorted(set(terms)), ensure_ascii=False)  # 空集合は "[]"
+        buf.append((text, label, qi))
+        n_clause += 1
+        if label == "PROFILE":
+            n_profile += 1
+        elif label == "NONE":
+            n_none += 1
+        if len(buf) >= args.insert_buffer:
+            conn.executemany("INSERT INTO spans (text, label, qi_json) VALUES (?, ?, ?)", buf)
+            conn.commit()
+            buf.clear()
+            if args.progress_every > 0 and n_clause % args.progress_every == 0:
+                el = max(1e-9, time.time() - started)
+                print(f"[progress] clause={n_clause:,} speed={n_clause / el:.0f}/s")
+    if buf:
+        conn.executemany("INSERT INTO spans (text, label, qi_json) VALUES (?, ?, ?)", buf)
+        conn.commit()
+
+    # distinct text に集約。曖昧ラベルは MAX(label)= PROFILE 優先(リスク過小評価を避ける)
+    conn.execute("DROP TABLE IF EXISTS span_uniq;")
+    conn.execute(
+        "CREATE TABLE span_uniq AS "
+        "SELECT text, MAX(label) AS label, MAX(qi_json) AS qi_json, COUNT(*) AS freq "
+        "FROM spans GROUP BY text"
+    )
+    conn.commit()
+    n_uniq = int(conn.execute("SELECT COUNT(*) FROM span_uniq").fetchone()[0])
+
+    with args.output.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.writer(fw)
+        writer.writerow(["text", "label", "qi_json", "size", "freq"])
+        for text, label, qi_json, freq in conn.execute(
+            "SELECT text, label, qi_json, freq FROM span_uniq ORDER BY freq DESC"
+        ):
+            try:
+                size = len(json.loads(qi_json))
+            except json.JSONDecodeError:
+                size = 0
+            writer.writerow([text, label, qi_json, size, freq])
+    conn.close()
+
+    print(f"\n  clause 総数={n_clause:,} (PROFILE={n_profile:,} NONE={n_none:,})")
+    print(f"  distinct text={n_uniq:,} → {args.output}")
+
+
+def _load_support_index(
+    phrase_sets_csv: Path,
+) -> tuple[dict[str, int], dict[str, str]]:
+    """06_phrase_set_records.csv を {qi_json: record_count} と {qi_json: strictest_tier} に読む。"""
+    support: dict[str, int] = {}
+    strict: dict[str, str] = {}
+    df = pd.read_csv(phrase_sets_csv)
+    tiers_series = df["tiers_json"] if "tiers_json" in df.columns else [None] * len(df)
+    for tj, tij, cnt in zip(df["terms_json"], tiers_series, df["record_count"]):
+        support[str(tj)] = int(cnt)
+        if isinstance(tij, str):
+            try:
+                strict[str(tj)] = strictest_tier(json.loads(tij)) or ""
+            except json.JSONDecodeError:
+                strict[str(tj)] = ""
+    return support, strict
+
+
+def cmd_sample_spans(args: argparse.Namespace) -> None:
+    """案2: span(text)中心の再識別リスク学習データを LDS バランスで作る。"""
+    import numpy as np
+
+    # N(総レコード)
+    N = 0
+    meta_path = Path(args.meta_json)
+    if meta_path.exists():
+        try:
+            N = int(json.loads(meta_path.read_text(encoding="utf-8")).get("N", 0))
+        except (ValueError, json.JSONDecodeError):
+            N = 0
+    if N <= 0:
+        raise ValueError(f"{meta_path} から N を取得できません。risk-sets を先に実行してください。")
+
+    support, strict = _load_support_index(args.phrase_sets_csv)
+    item_support: dict[str, int] = {}
+    if Path(args.term_records_csv).exists():
+        tdf = pd.read_csv(args.term_records_csv)
+        item_support = {str(t): int(c) for t, c in zip(tdf["term"], tdf["record_count"])}
+
+    print("=" * 64)
+    print("  span 中心 再識別リスク学習データ生成(案2 / LDS)")
+    print("=" * 64)
+    spans = pd.read_csv(args.span_records_csv,
+                        usecols=["text", "label", "qi_json", "size", "freq"],
+                        dtype={"label": "category", "size": "int32", "freq": "int64"},
+                        keep_default_na=False)
+    print(f"  N={N}  span(distinct text)={len(spans):,}  最大 y=log10(N)={math.log10(N):.3f}")
+
+    # support / y_risk を算出
+    sup = spans["qi_json"].map(support)               # 非空PROFILEは必ずヒット
+    is_profile = spans["label"].astype(str) == "PROFILE"
+    is_none = spans["label"].astype(str) == "NONE"
+    has_qi = spans["size"] > 0
+
+    drop = is_profile & ~has_qi                        # PROFILE だが QI 抽出なし → 除外
+    n_drop = int(drop.sum())
+    spans = spans[~drop].copy()
+    sup = sup[~drop]
+    is_profile = is_profile[~drop]
+    is_none = is_none[~drop]
+    has_qi = has_qi[~drop]
+
+    spans["support"] = sup.fillna(0).astype("int64").values
+    y = np.where(is_none.values, 0.0,
+                 np.log10(N / np.maximum(1, spans["support"].values)))
+    spans["y_risk"] = np.round(y, 6)
+    spans["provenance"] = np.where(is_none.values, "NONE", "PROFILE")
+
+    # カテゴリ分け
+    cat_profile = spans[spans["provenance"] == "PROFILE"]
+    none_all = spans[spans["provenance"] == "NONE"]
+    none_match = none_all[none_all["size"] > 0]
+    none_empty = none_all[none_all["size"] == 0]
+    n_sup1 = int((cat_profile["support"] == 1).sum())
+    print(f"  除外(PROFILE/QI無)={n_drop:,}")
+    print(f"  PROFILE={len(cat_profile):,} (うち support=1: {n_sup1:,})  "
+          f"NONE_match={len(none_match):,}  NONE_empty={len(none_empty):,}")
+
+    rng = np.random.default_rng(args.seed)
+
+    def subsample(d: pd.DataFrame, cap: int) -> pd.DataFrame:
+        if cap and 0 < cap < len(d):
+            idx = rng.choice(len(d), size=cap, replace=False)
+            return d.iloc[np.sort(idx)]
+        return d
+
+    # PROFILE: support=1 のスパイクのみ間引き、support>=2 は全保持
+    prof_sup1 = subsample(cat_profile[cat_profile["support"] == 1], args.max_support1)
+    prof_rest = cat_profile[cat_profile["support"] >= 2]
+    # NONE: マッチ有(ハードネガ)は全保持、空マッチは上限
+    none_empty = subsample(none_empty, args.max_none_empty)
+
+    out = pd.concat([prof_rest, prof_sup1, none_match, none_empty], ignore_index=True)
+    print(f"  → バランス後: PROFILE={len(prof_rest) + len(prof_sup1):,} "
+          f"(support=1 を {len(prof_sup1):,} に間引き)  "
+          f"NONE={len(none_match) + len(none_empty):,}  計={len(out):,}")
+
+    # LDS 重み
+    ys = out["y_risk"].tolist()
+    out["lds_weight"] = [round(w, 6) for w in
+                         lds_weights(ys, args.lds_bins, args.lds_sigma, args.weight_clip)]
+
+    # tier_strictest
+    out["tier_strictest"] = out["qi_json"].map(lambda q: strict.get(q, ""))
+
+    # train/test 分割(最レア構成語でグループ化, 空QI は text ハッシュ)
+    import hashlib
+
+    def split_key(qi_json: str, text: str) -> str:
+        try:
+            terms = json.loads(qi_json)
+        except json.JSONDecodeError:
+            terms = []
+        if terms:
+            return min(terms, key=lambda t: (item_support.get(t, 0), t))
+        return "EMPTY:" + hashlib.md5(text.encode()).hexdigest()[:12]
+
+    thr = int(args.test_frac * 1000)
+    splits = []
+    for qi_json, text in zip(out["qi_json"], out["text"]):
+        gk = split_key(qi_json, text)
+        h = int(hashlib.md5(f"{args.seed}:{gk}".encode()).hexdigest(), 16) % 1000
+        splits.append("test" if h < thr else "train")
+    out["split"] = splits
+    out["N"] = N
+
+    # max-samples(任意・LDS重み比例の物理間引き)
+    if args.max_samples and 0 < args.max_samples < len(out):
+        w = np.asarray(out["lds_weight"].values, dtype=float)
+        w = w / w.sum()
+        sel = rng.choice(len(out), size=args.max_samples, replace=False, p=w)
+        out = out.iloc[np.sort(sel)].copy()
+        out["lds_weight"] = [round(v, 6) for v in
+                             lds_weights(out["y_risk"].tolist(), args.lds_bins,
+                                         args.lds_sigma, args.weight_clip)]
+        print(f"  max-samples={args.max_samples}: 重み比例抽出で {len(out):,} 件に縮小")
+
+    cols = ["provenance", "text", "qi_json", "size", "support", "N", "y_risk",
+            "lds_weight", "split", "tier_strictest", "freq"]
+    out[cols].to_csv(args.output, index=False)
+
+    n_test = int((out["split"] == "test").sum())
+    print(f"\n  y_risk: min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
+    print(f"  lds_weight: min={out['lds_weight'].min():.3f} max={out['lds_weight'].max():.3f}")
+    print(f"  split: train={len(out) - n_test:,}  test={n_test:,} (test_frac={args.test_frac})")
+    print(f"  → {len(out):,} 件 / {len(cols)} 列(text 含む) → {args.output}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLI
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -2611,6 +2949,52 @@ def parse_args() -> argparse.Namespace:
     prs.add_argument("--progress-every", type=int, default=1_000_000,
                      help="進捗表示する明細行間隔(0で無効)")
     prs.set_defaults(func=cmd_risk_sets)
+
+    # span-join(案2: clause に text/label/QI集合を紐づけ distinct text へ集約)
+    psj = sub.add_parser(
+        "span-join",
+        help="元jsonl×detail jsonl を join し span(text/label/QI集合)素材を作る(案2)")
+    psj.add_argument("--input", type=Path, default=LABELED_CLAUSES_PATH,
+                     help="元アノテーション JSONL(clause/label/uuid/field)")
+    psj.add_argument("--detail", type=Path,
+                     default=DATA_DIR / "05_clause_matched_terms.jsonl",
+                     help="cooccurrence の clause 明細 JSONL(uuid/field/matched_terms)")
+    psj.add_argument("--work-db", type=Path, default=DATA_DIR / "06_span_join.sqlite3",
+                     help="集約用の一時 SQLite(実行ごとに作り直し)")
+    psj.add_argument("--insert-buffer", type=int, default=50000,
+                     help="SQLite へ一括INSERTするバッファ行数")
+    psj.add_argument("--progress-every", type=int, default=2_000_000,
+                     help="進捗表示する clause 間隔(0で無効)")
+    psj.add_argument("--output", type=Path, default=SPAN_REC_PATH)
+    psj.set_defaults(func=cmd_span_join)
+
+    # sample-spans(案2: span(text)中心の LDS バランス学習データ)
+    psp = sub.add_parser(
+        "sample-spans",
+        help="span(text)中心の再識別リスク学習データを作る(X=text, 埋め込みは別コード)")
+    psp.add_argument("--span-records-csv", type=Path, default=SPAN_REC_PATH,
+                     help="span-join の出力(text/label/qi_json/size/freq)")
+    psp.add_argument("--phrase-sets-csv", type=Path, default=PHRASE_SET_PATH,
+                     help="support 参照用 risk-sets の phrase 集合 CSV")
+    psp.add_argument("--term-records-csv", type=Path, default=TERM_REC_PATH,
+                     help="split グループ化(最レア構成語)用の単独語レコード数 CSV")
+    psp.add_argument("--meta-json", type=Path, default=RISK_SETS_META_PATH,
+                     help="総レコード N を含む risk-sets meta")
+    psp.add_argument("--max-support1", type=int, default=0,
+                     help="PROFILE の support=1(ユニーク=最大リスク)の保持上限。0で全保持。"
+                          "スパイク間引き量は検証メトリクスでスイープして決める")
+    psp.add_argument("--max-none-empty", type=int, default=0,
+                     help="NONE 空マッチ span の保持上限。0で全保持(マッチ有NONEは常に全保持)")
+    psp.add_argument("--lds-bins", type=int, default=50, help="LDS の分割数")
+    psp.add_argument("--lds-sigma", type=float, default=2.0, help="LDS ガウス平滑核の σ")
+    psp.add_argument("--weight-clip", type=float, default=10.0,
+                     help="lds_weight の頭打ち倍率(0で無効)")
+    psp.add_argument("--max-samples", type=int, default=0,
+                     help="出力上限(0=全件)。指定時は LDS 重み比例の非復元抽出で物理縮小")
+    psp.add_argument("--test-frac", type=float, default=0.2, help="test 分割比率")
+    psp.add_argument("--seed", type=int, default=42)
+    psp.add_argument("--output", type=Path, default=REID_OUT_PATH)
+    psp.set_defaults(func=cmd_sample_spans)
 
     # sample-balanced(目的B: 再識別リスクの LDS 重み付きバランス学習データ)
     psb = sub.add_parser(

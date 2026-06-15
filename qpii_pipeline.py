@@ -2733,6 +2733,7 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
           f"NONE_match={len(none_match):,}  NONE_empty={len(none_empty):,}")
 
     rng = np.random.default_rng(args.seed)
+    import hashlib
 
     def subsample(d: pd.DataFrame, cap: int) -> pd.DataFrame:
         if cap and 0 < cap < len(d):
@@ -2740,28 +2741,8 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
             return d.iloc[np.sort(idx)]
         return d
 
-    # PROFILE: support=1 のスパイクのみ間引き、support>=2 は全保持
-    prof_sup1 = subsample(cat_profile[cat_profile["support"] == 1], args.max_support1)
-    prof_rest = cat_profile[cat_profile["support"] >= 2]
-    # NONE: マッチ有(ハードネガ)は全保持、空マッチは上限
-    none_empty = subsample(none_empty, args.max_none_empty)
-
-    out = pd.concat([prof_rest, prof_sup1, none_match, none_empty], ignore_index=True)
-    print(f"  → バランス後: PROFILE={len(prof_rest) + len(prof_sup1):,} "
-          f"(support=1 を {len(prof_sup1):,} に間引き)  "
-          f"NONE={len(none_match) + len(none_empty):,}  計={len(out):,}")
-
-    # LDS 重み
-    ys = out["y_risk"].tolist()
-    out["lds_weight"] = [round(w, 6) for w in
-                         lds_weights(ys, args.lds_bins, args.lds_sigma, args.weight_clip)]
-
-    # tier_strictest
-    out["tier_strictest"] = out["qi_json"].map(lambda q: strict.get(q, ""))
-
-    # train/test 分割(最レア構成語でグループ化, 空QI は text ハッシュ)
-    import hashlib
-
+    # ---- train/test 分割を「キャップ前の自然分布」で先に決める(リーク防止) ----
+    # qi 構成語の最レア語(空QIはtextハッシュ)でグループ化し、同一グループは同一splitへ。
     def split_key(qi_json: str, text: str) -> str:
         try:
             terms = json.loads(qi_json)
@@ -2772,32 +2753,84 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
         return "EMPTY:" + hashlib.md5(text.encode()).hexdigest()[:12]
 
     thr = int(args.test_frac * 1000)
-    splits = []
-    for qi_json, text in zip(out["qi_json"], out["text"]):
-        gk = split_key(qi_json, text)
-        h = int(hashlib.md5(f"{args.seed}:{gk}".encode()).hexdigest(), 16) % 1000
-        splits.append("test" if h < thr else "train")
-    out["split"] = splits
-    out["N"] = N
 
-    # max-samples(任意・LDS重み比例の物理間引き)
-    if args.max_samples and 0 < args.max_samples < len(out):
-        w = np.asarray(out["lds_weight"].values, dtype=float)
-        w = w / w.sum()
-        sel = rng.choice(len(out), size=args.max_samples, replace=False, p=w)
-        out = out.iloc[np.sort(sel)].copy()
-        out["lds_weight"] = [round(v, 6) for v in
-                             lds_weights(out["y_risk"].tolist(), args.lds_bins,
-                                         args.lds_sigma, args.weight_clip)]
-        print(f"  max-samples={args.max_samples}: 重み比例抽出で {len(out):,} 件に縮小")
+    def assign_split(df: pd.DataFrame) -> np.ndarray:
+        s = []
+        for qi_json, text in zip(df["qi_json"], df["text"]):
+            gk = split_key(qi_json, text)
+            h = int(hashlib.md5(f"{args.seed}:{gk}".encode()).hexdigest(), 16) % 1000
+            s.append("test" if h < thr else "train")
+        return np.asarray(s)
+
+    spans["split"] = assign_split(spans)
+    is_train = spans["split"].values == "train"
+    is_prof = (spans["provenance"] == "PROFILE").values
+    is_none_v = ~is_prof
+    sup1 = spans["support"].values == 1          # clamp 済なので support>=1 が保証される
+    size0 = spans["size"].values == 0
+
+    # キャップ(support=1 スパイク / 空NONE)の適用範囲。
+    # 既定: train のみリバランスし、test は自然分布で固定(評価の妥当性のため)。
+    if args.rebalance_train_only:
+        test_part = spans[~is_train]
+        tr_prof_sup1 = subsample(spans[is_train & is_prof & sup1], args.max_support1)
+        tr_prof_rest = spans[is_train & is_prof & ~sup1]
+        tr_none_match = spans[is_train & is_none_v & ~size0]      # ハードネガは全保持
+        tr_none_empty = subsample(spans[is_train & is_none_v & size0], args.max_none_empty)
+        train_part = pd.concat(
+            [tr_prof_rest, tr_prof_sup1, tr_none_match, tr_none_empty], ignore_index=True)
+        out = pd.concat([train_part, test_part], ignore_index=True)
+        print(f"  → train(リバランス): "
+              f"PROFILE={len(tr_prof_rest) + len(tr_prof_sup1):,} "
+              f"(support=1 を {len(tr_prof_sup1):,} に間引き)  "
+              f"NONE={len(tr_none_match) + len(tr_none_empty):,}  計={len(train_part):,}")
+        print(f"  → test(自然分布・固定): {len(test_part):,}")
+    else:
+        prof_sup1 = subsample(spans[is_prof & sup1], args.max_support1)
+        prof_rest = spans[is_prof & ~sup1]
+        nm = spans[is_none_v & ~size0]
+        ne = subsample(spans[is_none_v & size0], args.max_none_empty)
+        out = pd.concat([prof_rest, prof_sup1, nm, ne], ignore_index=True)
+        print(f"  → バランス後(全体): PROFILE={len(prof_rest) + len(prof_sup1):,} "
+              f"(support=1 を {len(prof_sup1):,} に間引き)  "
+              f"NONE={len(nm) + len(ne):,}  計={len(out):,}")
+
+    out["N"] = N
+    out["tier_strictest"] = out["qi_json"].map(lambda q: strict.get(q, ""))
+
+    # LDS 重み: train 分布で算出(モデルが見る分布)。test は評価=自然分布なので 1.0。
+    out["lds_weight"] = 1.0
+    tr_mask = out["split"].values == "train"
+    if tr_mask.any():
+        tr_w = lds_weights(out.loc[tr_mask, "y_risk"].tolist(),
+                           args.lds_bins, args.lds_sigma, args.weight_clip)
+        out.loc[tr_mask, "lds_weight"] = np.round(np.asarray(tr_w, dtype=float), 6)
+
+    # max-samples(任意・train のみ LDS重み比例で物理間引き。test は固定)
+    if args.max_samples and args.max_samples > 0:
+        tr_pos = np.where(out["split"].values == "train")[0]
+        if args.max_samples < len(tr_pos):
+            w = out["lds_weight"].values[tr_pos].astype(float)
+            w = w / w.sum()
+            keep = rng.choice(tr_pos, size=args.max_samples, replace=False, p=w)
+            mask = out["split"].values == "test"
+            mask[keep] = True
+            out = out[mask].copy()
+            tr2 = out["split"].values == "train"
+            out.loc[tr2, "lds_weight"] = np.round(np.asarray(
+                lds_weights(out.loc[tr2, "y_risk"].tolist(),
+                            args.lds_bins, args.lds_sigma, args.weight_clip), dtype=float), 6)
+            print(f"  max-samples={args.max_samples}: train を重み比例抽出 → 計 {len(out):,} 件")
 
     cols = ["provenance", "text", "qi_json", "size", "support", "N", "y_risk",
             "lds_weight", "split", "tier_strictest", "freq"]
     out[cols].to_csv(args.output, index=False)
 
     n_test = int((out["split"] == "test").sum())
+    tr_final = out["split"].values == "train"
     print(f"\n  y_risk: min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
-    print(f"  lds_weight: min={out['lds_weight'].min():.3f} max={out['lds_weight'].max():.3f}")
+    print(f"  lds_weight(train): min={out.loc[tr_final, 'lds_weight'].min():.3f} "
+          f"max={out.loc[tr_final, 'lds_weight'].max():.3f}")
     print(f"  split: train={len(out) - n_test:,}  test={n_test:,} (test_frac={args.test_frac})")
     print(f"  → {len(out):,} 件 / {len(cols)} 列(text 含む) → {args.output}")
 
@@ -2996,6 +3029,13 @@ def parse_args() -> argparse.Namespace:
                           "スパイク間引き量は検証メトリクスでスイープして決める")
     psp.add_argument("--max-none-empty", type=int, default=0,
                      help="NONE 空マッチ span の保持上限。0で全保持(マッチ有NONEは常に全保持)")
+    psp.add_argument("--rebalance-train-only", dest="rebalance_train_only",
+                     action="store_true", default=True,
+                     help="(既定)split を自然分布で先に決め、キャップは train のみ適用。"
+                          "test は自然分布で固定し評価の妥当性を担保する")
+    psp.add_argument("--rebalance-all", dest="rebalance_train_only",
+                     action="store_false",
+                     help="旧挙動: train/test 双方にキャップを適用する")
     psp.add_argument("--lds-bins", type=int, default=50, help="LDS の分割数")
     psp.add_argument("--lds-sigma", type=float, default=2.0, help="LDS ガウス平滑核の σ")
     psp.add_argument("--weight-clip", type=float, default=10.0,

@@ -2706,6 +2706,17 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     has_qi = has_qi[~drop]
 
     spans["support"] = sup.fillna(0).astype("int64").values
+    # support 未引当(=0)の PROFILE: qi_json が 06_phrase_set_records.csv に無い。
+    # serialization は span-join/risk-sets で同一なので、これが出る=phrase集合 CSV が
+    # 現在の detail と不整合(risk-sets を古い 05 で生成 等)の疑い。
+    # 黙って消さず support=1(最大リスク y=6)として保持し、件数を必ず可視化する。
+    prof_missing = (is_profile.values & (spans["support"].values == 0))
+    n_missing = int(prof_missing.sum())
+    if n_missing:
+        print(f"  [warn] support 未引当の PROFILE span={n_missing:,} "
+              f"({100 * n_missing / max(1, len(spans)):.2f}%) → support=1 として保持。"
+              f"多い場合は 06_phrase_set_records.csv が古い可能性 → risk-sets 再実行を推奨。")
+        spans.loc[prof_missing, "support"] = 1
     y = np.where(is_none.values, 0.0,
                  np.log10(N / np.maximum(1, spans["support"].values)))
     spans["y_risk"] = np.round(y, 6)

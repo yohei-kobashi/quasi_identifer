@@ -95,7 +95,10 @@ try:
     sys.path.insert(0, str(Path(__file__).parent))
 except NameError:
     sys.path.insert(0, str(Path.cwd()))
-from config import DATA_DIR, KEEP_POS_PREFIXES, MIN_PHRASE_FREQ, TEXT_FIELDS
+from config import (
+    DATA_DIR, KEEP_POS_PREFIXES, METHOD_B_KEEP_SINGLE_WORD, MIN_PHRASE_FREQ,
+    NP_GRAMMAR_MODE, TEXT_FIELDS,
+)
 
 # ── パス ────────────────────────────────────────────────────────────────────
 # 入力は annotate_with_deberta_usa.py の予測アノテーション(JSONL, clause/label を含む)。
@@ -121,9 +124,17 @@ MAX_ALPHA: float = 0.10
 COMPARE_ALPHAS: list[float] = [0.01, 0.05, 0.10]
 
 # Method B / cooccurrence: NP 文法(longest enclosing NP 抽出用)
-NP_GRAMMAR: str = r"""
-  NP: {<DT>?<JJ.*>*<NN.*>+(<IN><DT>?<JJ.*>*<NN.*>+)*}
-"""
+# NP チャンク文法。config.NP_GRAMMAR_MODE で具体性レベルを切替(②: support=1 抑制)。
+# base/pp1/chain の3変種を用意し、再生成で A/B/従来 を比較できるようにする。
+_NP_GRAMMARS: dict[str, str] = {
+    "base":  r"NP: {<DT>?<JJ.*>*<NN.*>+}",
+    "pp1":   r"NP: {<DT>?<JJ.*>*<NN.*>+(<IN><DT>?<JJ.*>*<NN.*>+)?}",
+    "chain": r"NP: {<DT>?<JJ.*>*<NN.*>+(<IN><DT>?<JJ.*>*<NN.*>+)*}",
+}
+if NP_GRAMMAR_MODE not in _NP_GRAMMARS:
+    raise ValueError(
+        f"config.NP_GRAMMAR_MODE が不正: {NP_GRAMMAR_MODE!r}(有効: {sorted(_NP_GRAMMARS)})")
+NP_GRAMMAR: str = _NP_GRAMMARS[NP_GRAMMAR_MODE]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -764,8 +775,8 @@ def run_method_b(
 
     rows: list[dict] = []
     for phrase, freq in phrase_freq.most_common():
-        if len(phrase.split()) < 2:  # 1語は Method A でカバー済み
-            continue
+        if not METHOD_B_KEEP_SINGLE_WORD and len(phrase.split()) < 2:
+            continue  # 従来: 1語は Method A 担当として辞書から除外(②-full では保持)
         examples = phrase_examples[phrase]
         tier = phrase_alpha_tier(phrase, token_tier)
         source_tokens = [w for w in phrase.split() if w in token_tier]

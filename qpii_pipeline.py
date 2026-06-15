@@ -2697,7 +2697,10 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     is_none = spans["label"].astype(str) == "NONE"
     has_qi = spans["size"] > 0
 
-    drop = is_profile & ~has_qi                        # PROFILE だが QI 抽出なし → 除外
+    # NONE 以外で QI 抽出が無い span は除外(PROFILE-空 も PII-空 も)。
+    # ※ is_profile(=label=="PROFILE") だけで判定すると、label=="PII" の空QIが
+    #   provenance="PROFILE"・support=0 → y=log10(N/1)=6.0 で混入してしまう。
+    drop = (~is_none) & ~has_qi
     n_drop = int(drop.sum())
     spans = spans[~drop].copy()
     sup = sup[~drop]
@@ -2728,8 +2731,10 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     none_match = none_all[none_all["size"] > 0]
     none_empty = none_all[none_all["size"] == 0]
     n_sup1 = int((cat_profile["support"] == 1).sum())
-    print(f"  除外(PROFILE/QI無)={n_drop:,}")
-    print(f"  PROFILE={len(cat_profile):,} (うち support=1: {n_sup1:,})  "
+    n_pii = int((cat_profile["label"].astype(str) == "PII").sum())
+    print(f"  除外(QI無/非NONE: PROFILE-空+PII-空)={n_drop:,}")
+    print(f"  PROFILE={len(cat_profile):,} (うち support=1: {n_sup1:,}, "
+          f"label=PII を {n_pii:,} 含む)  "
           f"NONE_match={len(none_match):,}  NONE_empty={len(none_empty):,}")
 
     rng = np.random.default_rng(args.seed)

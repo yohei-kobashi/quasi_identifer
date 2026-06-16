@@ -36,8 +36,11 @@
   data/06_term_records.csv              単独語の出現レコード数(risk-sets; 特徴量 const_support 用)
   data/06_risk_sets_meta.json           risk-sets のメタ(総レコード N など)
   data/06_span_records.csv              span(text/label/QI集合/freq)素材(span-join; 案2)
-  data/07_reid_samples.csv              再識別リスク学習データ(y_risk + LDS 重み + train/test)
-                                        sample-spans 版は text 列(X=埋め込みの元)を含む
+  data/07_reid_samples.csv              再識別リスク学習データ(y_risk/y_bits/y_combined + LDS + train/test)
+                                        sample-spans 版は text 列(X=埋め込みの元)を含む。
+                                        y_risk=log10(N/support)(support=1で飽和), y_bits=Σlog10(N/df)
+                                        (飽和域を段階化, 非キャップ), y_combined=support>=2はy_risk・
+                                        support=1はy_bits(案1階層), min_constituent_df=最レア構成語DF
   (--unit で出力単位を選択可。既定は3つすべて。--no-pairs でペア出力を無効)
 
 単語の有意性は FDR(Benjamini-Hochberg)の q 値で判定する(主解析 q=0.05)。
@@ -2750,6 +2753,48 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     spans["y_risk"] = np.round(y, 6)
     spans["provenance"] = np.where(is_none.values, "NONE", "PROFILE")
 
+    # ---- y_bits: 構成属性の識別情報量(独立仮定) Σ -log10(df_t/N) = Σ log10(N/df_t) ----
+    # support は support=1(=ユニーク)で飽和し 71% を区別できないが、y_bits は属性の
+    # 希少度と数に応じて連続に伸びるため、その飽和域を段階化できる(=同定の頑健さ)。
+    # NONE は annotation により非識別(=0)とみなす。相関は無視するため識別性の「上界」。
+    log10N = math.log10(N)
+    term_bits = {t: log10N - math.log10(max(1, c)) for t, c in item_support.items()}
+    ybits = np.zeros(len(spans), dtype=float)
+    mindf = np.zeros(len(spans), dtype=np.int64)
+    is_none_arr = is_none.values
+    qi_arr = spans["qi_json"].values
+    for i in range(len(spans)):
+        if is_none_arr[i]:
+            continue                                  # NONE → y_bits=0, min_df=0
+        try:
+            terms = json.loads(qi_arr[i])
+        except json.JSONDecodeError:
+            continue
+        if not terms:
+            continue
+        b = 0.0
+        md = 1 << 62
+        for t in terms:
+            ts = str(t)
+            b += term_bits.get(ts, log10N)            # 未知語は df=1(=最大 log10N)
+            df = item_support.get(ts, 1)
+            if df < 1:
+                df = 1
+            if df < md:
+                md = df
+        ybits[i] = b
+        mindf[i] = md
+    spans["y_bits"] = np.round(ybits, 6)                       # 非キャップ(6超で同定頑健さ)
+    spans["y_bits_capped"] = np.round(np.minimum(log10N, ybits), 6)
+    spans["min_constituent_df"] = mindf                       # 最レア構成語の record_count
+    # y_combined(案1・階層): support>=2 は経験的 y_risk(相関考慮)、support=1 は y_bits で
+    # 6 超へ拡張(飽和域を段階化)、NONE は 0。相関は推定可能な support>=2 だけで使う。
+    sup_arr = spans["support"].values
+    ycomb = np.where(is_none_arr, 0.0,
+                     np.where(sup_arr >= 2, spans["y_risk"].values,
+                              np.maximum(log10N, ybits)))
+    spans["y_combined"] = np.round(ycomb, 6)
+
     # カテゴリ分け
     cat_profile = spans[spans["provenance"] == "PROFILE"]
     none_all = spans[spans["provenance"] == "NONE"]
@@ -2852,17 +2897,25 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
                             args.lds_bins, args.lds_sigma, args.weight_clip), dtype=float), 6)
             print(f"  max-samples={args.max_samples}: train を重み比例抽出 → 計 {len(out):,} 件")
 
-    cols = ["provenance", "text", "qi_json", "size", "support", "N", "y_risk",
+    cols = ["provenance", "text", "qi_json", "size", "support", "N",
+            "y_risk", "y_bits", "y_bits_capped", "min_constituent_df", "y_combined",
             "lds_weight", "split", "tier_strictest", "freq"]
     out[cols].to_csv(args.output, index=False)
 
     n_test = int((out["split"] == "test").sum())
     tr_final = out["split"].values == "train"
-    print(f"\n  y_risk: min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
-    print(f"  lds_weight(train): min={out.loc[tr_final, 'lds_weight'].min():.3f} "
+    prof = out[out["provenance"] == "PROFILE"]
+    print(f"\n  y_risk    : min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
+    print(f"  y_bits    : min={out['y_bits'].min():.3f} max={out['y_bits'].max():.3f} "
+          f"median={out['y_bits'].median():.3f}  (PROFILE のみ: "
+          f"median={prof['y_bits'].median():.3f} max={prof['y_bits'].max():.3f})")
+    print(f"  y_combined: min={out['y_combined'].min():.3f} max={out['y_combined'].max():.3f} "
+          f"(support=1 を y_bits で 6 超へ段階化)")
+    print(f"  lds_weight(train, y_risk基準): min={out.loc[tr_final, 'lds_weight'].min():.3f} "
           f"max={out.loc[tr_final, 'lds_weight'].max():.3f}")
     print(f"  split: train={len(out) - n_test:,}  test={n_test:,} (test_frac={args.test_frac})")
     print(f"  → {len(out):,} 件 / {len(cols)} 列(text 含む) → {args.output}")
+    print(f"  [注] lds_weight は y_risk 基準。y_combined/y_bits で学習する場合は各自で再計算を。")
 
 
 # ════════════════════════════════════════════════════════════════════════════

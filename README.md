@@ -70,8 +70,90 @@ PROFILE clause 数）を閾値として切る。`freq` の分布は強い裾の�
 (ii) 実データ上で非識別マーカーと実属性が分離する経験的境界の双方から正当化される、
 データ駆動かつ最小侵襲の選択である。
 
+---
+
+## 再識別リスクの目的変数：support 飽和と `y_combined` 階層設計
+
+### support ベースリスクの飽和問題
+
+各 span の再識別リスクを `y_risk = log10(N / support)`（`support` = その QI 集合を共有する
+レコード数）で定義すると、`support = 1`（標本中で一意）の span はすべて上限
+`y_risk = log10(N) = 6` を取る。問題は、**リッチな自由記述ペルソナでは大多数の個人が一意になる**
+こと（unicity; de Montjoye et al., 2013; Rocher et al., 2019）である。本データでは PROFILE
+span 27,426,378 のうち **19,242,549（70.2 %）が support = 1** であり、これらが全て `y_risk = 6`
+に潰れる。順位学習（AUC 評価）にとってラベルが飽和した退化状態となる。
+
+この飽和は QI 抽出の粒度を変えても解けない。長い名詞句（連鎖 NP）では一意な**文字列**として、
+基底名詞句では高次元属性集合の一意な**組合せ**として現れるだけで、source が変わるだけである
+（実測で support = 1 比率は連鎖 NP で約 40 %、基底 NP で約 73 %）。すなわち飽和は前処理の
+不備ではなく、データの真の性質である。
+
+### `y_bits`：識別情報量（独立仮定）
+
+そこで support とは別軸の連続量として、構成属性の**識別情報量**を導入する：
+
+```
+y_bits = Σ_{t ∈ QI集合} −log10( df_t / N ) = Σ_{t} log10( N / df_t )
+```
+
+`df_t` は属性 `t` の出現レコード数。`−log10(df_t/N)` は Shannon の自己情報量（surprisal;
+Shannon, 1948）で、「その属性を知ると母集団が何桁絞られるか」を表す。和は各属性の絞り込みの
+合計であり、`log10(N) = 6` を超えて伸びる。`y_risk` が `support = 1` で飽和するのに対し、
+`y_bits` は**属性の希少度と数に応じて連続に増加**するため、飽和域（一意化された塊）を
+「同定の頑健さ＝外部データへの照合容易さ」によって段階化できる。
+
+`y_bits` は属性間の相関を無視（独立を仮定）するため相関属性を二重計上し、識別性の**上界**を
+与える。NONE span は annotation により非識別とみなし `y_bits = 0` とする。
+
+### `y_combined`：相関の推定可能性に基づく階層設計
+
+`y_risk`（経験的 support、相関を織り込む）と `y_bits`（周辺頻度、相関を無視）は競合ではなく
+**領域ごとに補完**する。鍵は「相関は反復観測がある領域でのみ推定できる」点である。
+`support ≥ 2` の集合は複数レコードで観測されるため共起＝相関の推定が信頼でき、`y_risk` が
+正確。一方 `support = 1`（n = 1）の集合では相関を推定する情報が無く、`y_risk` も飽和する。
+そこで推定可能な領域でのみ経験的リスクを用い、推定不能な飽和域は周辺頻度ベースに委ねる：
+
+```
+y_combined = 0                          (NONE; 非識別アンカー)
+           = log10(N / support)         (support ≥ 2; 経験的・相関考慮; 区間 [0, 6))
+           = max( log10(N), y_bits )     (support = 1; 周辺頻度で段階化; 区間 [6, ∞))
+```
+
+独立仮定（相関無視）は飽和域では欠点ではなく、(i) n = 1 で推定できない相関を諦めた頑健な
+近似であり、(ii) 標本固有の共起構造より周辺頻度の方が未知テキストへ**転移しやすく**、
+(iii) 合成（LLM 生成）データに含まれる生成器由来の共起アーティファクトに頑健、という利点を持つ。
+
+### PII tier：直接識別子
+
+氏名等の**直接識別子**を含む PII span は、QI の希少度に依らず再識別が確実（certain
+re-identification）であり最大リスクである。これを `provenance = "PII"` で PROFILE と区別
+できる第3カテゴリとして保持しつつ、各リスクスケールの上限へ固定する（`y_risk = log10(N)`、
+非有界の `y_combined`/`y_bits` は PROFILE 内最大値 = ceiling に揃え、全 PROFILE 以上に配置）。
+区別フラグにより、下流は PII を回帰から分離して二値最大リスククラスとして扱うことも、
+ceiling 値のまま回帰に含めることも選べる。
+
+### 実証分布
+
+上記により得た `y_combined` は、飽和した単峰ラベルから**連続・段階的な4層構造**へ変換される
+（N = 1,000,000、span 38,690,112 件）：
+
+| 層 | 件数（割合） | `y_combined` | 段階化の根拠 |
+|---|---|---|---|
+| NONE | 2,345,741（6.1 %）| 0 | 非識別アンカー |
+| PROFILE `support ≥ 2` | 8,183,829（21.1 %）| [1, 6) | 経験的 `y_risk`（相関考慮）|
+| PROFILE `support = 1` | 19,242,549（49.7 %）| [6, 60.65] | `y_bits`（識別情報量）|
+| PII | 8,917,993（23.1 %）| 60.65（ceiling）| 直接識別子＝最大リスク |
+
+飽和していた `support = 1` の塊は `y_combined` 上で滑らかな右裾分布へ展開された
+（p25 = 6.41, median = 8.45, p75 = 11.09, p90 = 13.97, p99 = 20.26, max = 60.65）。
+学習データには `y_risk`・`y_bits`・`y_combined`・`min_constituent_df`（最レア構成語の DF）を
+併記し、下流が目的に応じて選択・合成できるようにしている。なお標本サイズ N = 10⁶ は
+米国人口（約 3.4 × 10⁸）の部分標本であり、`support = 1` は母集団の一意性ではなく標本解像度の
+下限（おおむね母集団で数百人規模）に対応する点に留意が必要である（右側打ち切り）。
+
 ### 参考文献
 
+- Shannon, C. E. (1948). *A mathematical theory of communication.* Bell System Technical Journal, 27(3), 379–423.
 - Sweeney, L. (2002). *k-anonymity: A model for protecting privacy.* International Journal of Uncertainty, Fuzziness and Knowledge-Based Systems, 10(5), 557–570.
 - de Montjoye, Y.-A., Hidalgo, C. A., Verleysen, M., & Blondel, V. D. (2013). *Unique in the crowd: The privacy bounds of human mobility.* Scientific Reports, 3, 1376.
 - Rocher, L., Hendrickx, J. M., & de Montjoye, Y.-A. (2019). *Estimating the success of re-identifications in incomplete datasets using generative models.* Nature Communications, 10, 3069.

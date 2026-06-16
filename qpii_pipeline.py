@@ -2751,7 +2751,11 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     y = np.where(is_none.values, 0.0,
                  np.log10(N / np.maximum(1, spans["support"].values)))
     spans["y_risk"] = np.round(y, 6)
-    spans["provenance"] = np.where(is_none.values, "NONE", "PROFILE")
+    # provenance 3値: NONE / PII(直接識別子=最大リスク) / PROFILE(QIで段階評価)。
+    # PII は PROFILE と区別しつつ最大リスク扱い(後段で各スケール上限へ固定)。
+    is_pii_arr = spans["label"].astype(str).values == "PII"
+    spans["provenance"] = np.where(is_none.values, "NONE",
+                                   np.where(is_pii_arr, "PII", "PROFILE"))
 
     # ---- y_bits: 構成属性の識別情報量(独立仮定) Σ -log10(df_t/N) = Σ log10(N/df_t) ----
     # support は support=1(=ユニーク)で飽和し 71% を区別できないが、y_bits は属性の
@@ -2795,16 +2799,33 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
                               np.maximum(log10N, ybits)))
     spans["y_combined"] = np.round(ycomb, 6)
 
+    # PII(直接識別子)= 最大リスク。PROFILE と区別(provenance="PII")しつつ各スケール上限へ:
+    # y_risk/y_bits_capped は log10(N)、非有界の y_bits/y_combined は PROFILE 内の最大値
+    # (ceiling)に揃え、全 PROFILE 以上に位置させる。区別フラグで下流が別扱いも可能。
+    prov_arr = spans["provenance"].values
+    prof_mask0 = prov_arr == "PROFILE"
+    pii_mask0 = prov_arr == "PII"
+    if prof_mask0.any():
+        ceil_bits = float(np.max(spans["y_bits"].values[prof_mask0]))
+        ceil_comb = float(np.max(spans["y_combined"].values[prof_mask0]))
+    else:
+        ceil_bits = ceil_comb = log10N
+    if pii_mask0.any():
+        spans.loc[pii_mask0, "y_risk"] = round(log10N, 6)
+        spans.loc[pii_mask0, "y_bits"] = round(ceil_bits, 6)
+        spans.loc[pii_mask0, "y_bits_capped"] = round(log10N, 6)
+        spans.loc[pii_mask0, "y_combined"] = round(ceil_comb, 6)
+
     # カテゴリ分け
     cat_profile = spans[spans["provenance"] == "PROFILE"]
+    cat_pii = spans[spans["provenance"] == "PII"]
     none_all = spans[spans["provenance"] == "NONE"]
     none_match = none_all[none_all["size"] > 0]
     none_empty = none_all[none_all["size"] == 0]
     n_sup1 = int((cat_profile["support"] == 1).sum())
-    n_pii = int((cat_profile["label"].astype(str) == "PII").sum())
     print(f"  除外(QI無/非NONE: PROFILE-空+PII-空)={n_drop:,}")
-    print(f"  PROFILE={len(cat_profile):,} (うち support=1: {n_sup1:,}, "
-          f"label=PII を {n_pii:,} 含む)  "
+    print(f"  PROFILE={len(cat_profile):,} (うち support=1: {n_sup1:,})  "
+          f"PII(最大リスク, y_risk=6/y_combined={ceil_comb:.2f})={len(cat_pii):,}  "
           f"NONE_match={len(none_match):,}  NONE_empty={len(none_empty):,}")
 
     rng = np.random.default_rng(args.seed)
@@ -2840,24 +2861,28 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     spans["split"] = assign_split(spans)
     is_train = spans["split"].values == "train"
     is_prof = (spans["provenance"] == "PROFILE").values
-    is_none_v = ~is_prof
+    is_none_v = (spans["provenance"] == "NONE").values
+    is_pii_v = (spans["provenance"] == "PII").values     # 最大リスク(全保持・無キャップ)
     sup1 = spans["support"].values == 1          # clamp 済なので support>=1 が保証される
     size0 = spans["size"].values == 0
 
     # キャップ(support=1 スパイク / 空NONE)の適用範囲。
     # 既定: train のみリバランスし、test は自然分布で固定(評価の妥当性のため)。
+    # PII は最大リスクなので train/test とも全保持(キャップしない)。
     if args.rebalance_train_only:
         test_part = spans[~is_train]
         tr_prof_sup1 = subsample(spans[is_train & is_prof & sup1], args.max_support1)
         tr_prof_rest = spans[is_train & is_prof & ~sup1]
         tr_none_match = spans[is_train & is_none_v & ~size0]      # ハードネガは全保持
         tr_none_empty = subsample(spans[is_train & is_none_v & size0], args.max_none_empty)
+        tr_pii = spans[is_train & is_pii_v]
         train_part = pd.concat(
-            [tr_prof_rest, tr_prof_sup1, tr_none_match, tr_none_empty], ignore_index=True)
+            [tr_prof_rest, tr_prof_sup1, tr_none_match, tr_none_empty, tr_pii],
+            ignore_index=True)
         out = pd.concat([train_part, test_part], ignore_index=True)
         print(f"  → train(リバランス): "
               f"PROFILE={len(tr_prof_rest) + len(tr_prof_sup1):,} "
-              f"(support=1 を {len(tr_prof_sup1):,} に間引き)  "
+              f"(support=1 を {len(tr_prof_sup1):,} に間引き)  PII={len(tr_pii):,}  "
               f"NONE={len(tr_none_match) + len(tr_none_empty):,}  計={len(train_part):,}")
         print(f"  → test(自然分布・固定): {len(test_part):,}")
     else:
@@ -2865,9 +2890,10 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
         prof_rest = spans[is_prof & ~sup1]
         nm = spans[is_none_v & ~size0]
         ne = subsample(spans[is_none_v & size0], args.max_none_empty)
-        out = pd.concat([prof_rest, prof_sup1, nm, ne], ignore_index=True)
+        pii = spans[is_pii_v]
+        out = pd.concat([prof_rest, prof_sup1, nm, ne, pii], ignore_index=True)
         print(f"  → バランス後(全体): PROFILE={len(prof_rest) + len(prof_sup1):,} "
-              f"(support=1 を {len(prof_sup1):,} に間引き)  "
+              f"(support=1 を {len(prof_sup1):,} に間引き)  PII={len(pii):,}  "
               f"NONE={len(nm) + len(ne):,}  計={len(out):,}")
 
     out["N"] = N
@@ -2905,7 +2931,10 @@ def cmd_sample_spans(args: argparse.Namespace) -> None:
     n_test = int((out["split"] == "test").sum())
     tr_final = out["split"].values == "train"
     prof = out[out["provenance"] == "PROFILE"]
-    print(f"\n  y_risk    : min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
+    n_pii_out = int((out["provenance"] == "PII").sum())
+    print(f"\n  provenance: PROFILE={len(prof):,}  PII={n_pii_out:,}(最大リスク)  "
+          f"NONE={int((out['provenance'] == 'NONE').sum()):,}")
+    print(f"  y_risk    : min={out['y_risk'].min():.3f} max={out['y_risk'].max():.3f}")
     print(f"  y_bits    : min={out['y_bits'].min():.3f} max={out['y_bits'].max():.3f} "
           f"median={out['y_bits'].median():.3f}  (PROFILE のみ: "
           f"median={prof['y_bits'].median():.3f} max={prof['y_bits'].max():.3f})")

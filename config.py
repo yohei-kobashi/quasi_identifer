@@ -58,6 +58,11 @@ CATEGORY_SIM_THRESHOLD: float = 0.45
 GENERAL_SIM_THRESHOLD: float = 0.55
 MIN_PHRASE_FREQ: int = 3          # minimum times a phrase must appear
 MAX_PHRASE_WORDS: int = 6         # maximum words in a phrase (exclude over-specific)
+# QI バンドパス上限。Method B 辞書 freq がこれを超える phrase(=ありふれ過ぎて非識別な
+# レジスターマーカー: enjoys/love 等)を許可語彙から除外する。0=上限なし。
+# 識別価値 ≈ -log(出現率) で、ほぼ全レコードに出る語は ~0 bit。下限 MIN_PHRASE_FREQ
+# (準直接識別子を除く)と合わせ、QI を「中頻度の帯」に限定する。
+MAX_PHRASE_FREQ: int = 0
 
 # ── Annotation sampling ────────────────────────────────────────────────────
 ANNOTATION_SAMPLE_N: int = 100

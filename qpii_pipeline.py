@@ -96,8 +96,8 @@ try:
 except NameError:
     sys.path.insert(0, str(Path.cwd()))
 from config import (
-    DATA_DIR, KEEP_POS_PREFIXES, METHOD_B_KEEP_SINGLE_WORD, MIN_PHRASE_FREQ,
-    NP_GRAMMAR_MODE, TEXT_FIELDS,
+    DATA_DIR, KEEP_POS_PREFIXES, METHOD_B_KEEP_SINGLE_WORD, MAX_PHRASE_FREQ,
+    MIN_PHRASE_FREQ, NP_GRAMMAR_MODE, TEXT_FIELDS,
 )
 
 # ── パス ────────────────────────────────────────────────────────────────────
@@ -195,22 +195,31 @@ def augment_token_tier_with_lemmas(token_tier: dict[str, str]) -> dict[str, str]
     return out
 
 
-def load_allowed_phrases(method_b_csv: Path, min_phrase_freq: int) -> Optional[set[str]]:
-    """Method B 辞書(04 CSV)を freq>=K で絞り、許可フレーズ集合を返す(案1)。
+def load_allowed_phrases(
+    method_b_csv: Path, min_phrase_freq: int, max_phrase_freq: int = 0,
+) -> Optional[set[str]]:
+    """Method B 辞書(04 CSV)を freq の帯 [min, max] で絞り許可フレーズ集合を返す(案1)。
 
-    min_phrase_freq<=0 なら None(フィルタ無効=自由NP)を返す。
+    バンドパス: min_phrase_freq で準直接識別子(レア)を、max_phrase_freq で
+    非識別なレジスターマーカー(ありふれ過ぎ: enjoys/love 等)を除外する。
+    両方 <=0 なら None(フィルタ無効=自由NP)を返す。max_phrase_freq<=0 で上限なし。
     """
-    if min_phrase_freq <= 0:
+    if min_phrase_freq <= 0 and max_phrase_freq <= 0:
         return None
     if not method_b_csv.exists():
         raise FileNotFoundError(
-            f"頻度フィルタ(--min-phrase-freq {min_phrase_freq})に必要な Method B 辞書が"
+            f"頻度フィルタ(min={min_phrase_freq}/max={max_phrase_freq})に必要な Method B 辞書が"
             f"見つかりません: {method_b_csv}\n先に `qpii_pipeline.py method-b` を実行してください。"
         )
     df = pd.read_csv(method_b_csv)
     if "phrase" not in df.columns or "freq" not in df.columns:
         raise ValueError(f"{method_b_csv} に phrase/freq 列が必要です")
-    return set(df[df["freq"] >= min_phrase_freq]["phrase"].astype(str))
+    mask = pd.Series(True, index=df.index)
+    if min_phrase_freq > 0:
+        mask &= df["freq"] >= min_phrase_freq
+    if max_phrase_freq > 0:
+        mask &= df["freq"] <= max_phrase_freq
+    return set(df[mask]["phrase"].astype(str))
 
 
 def make_np_parser() -> "nltk.RegexpParser":
@@ -1412,7 +1421,7 @@ def cmd_cooccurrence(args: argparse.Namespace) -> None:
     min_phrase_freq = resolve_min_phrase_freq(
         args.min_phrase_freq, candidate_tokens=candidate_tokens,
         workers=resolve_workers(args.workers), batch_size=256)
-    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq)
+    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq, args.max_phrase_freq)
     run_cooccurrence(args, candidate_tokens, token_tier, allowed)
 
 
@@ -1619,7 +1628,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     min_phrase_freq = resolve_min_phrase_freq(
         args.min_phrase_freq, candidate_tokens=candidate_tokens,
         workers=resolve_workers(args.workers), batch_size=256)
-    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq)
+    allowed = load_allowed_phrases(args.method_b_csv, min_phrase_freq, args.max_phrase_freq)
     run_benchmark(args, candidate_tokens, allowed)
 
 
@@ -1651,10 +1660,15 @@ def cmd_all(args: argparse.Namespace) -> None:
         args.min_phrase_freq,
         candidate_tokens=candidate_tokens, workers=args.workers, batch_size=args.batch_size,
     )
-    # 案1: Method B 辞書(正規化phrase + freq)を freq≥K で絞り共起の許可語彙にする
+    # 案1: Method B 辞書(正規化phrase + freq)を freq の帯[min,max]で絞り許可語彙にする
     allowed: Optional[set[str]] = None
-    if min_phrase_freq > 0 and not df_b.empty:
-        allowed = set(df_b[df_b["freq"] >= min_phrase_freq]["phrase"].astype(str))
+    if (min_phrase_freq > 0 or args.max_phrase_freq > 0) and not df_b.empty:
+        m = pd.Series(True, index=df_b.index)
+        if min_phrase_freq > 0:
+            m &= df_b["freq"] >= min_phrase_freq
+        if args.max_phrase_freq > 0:
+            m &= df_b["freq"] <= args.max_phrase_freq
+        allowed = set(df_b[m]["phrase"].astype(str))
 
     print("\n════ Stage 3/3: Record co-occurrence ════")
     run_cooccurrence(args, candidate_tokens, token_tier, allowed)
@@ -2876,6 +2890,9 @@ def _add_cooccurrence_args(p: argparse.ArgumentParser, with_candidates_csv: bool
     p.add_argument("--min-phrase-freq", type=str, default=str(MIN_PHRASE_FREQ),
                    help="層2 フレーズ頻度フィルタ(案1): Method B 辞書で freq≥K の phrase のみ採用。"
                         "整数 or 'auto'(2-fold 再現率 ρ(r)>=0.5 の最小頻度)。0でフィルタ無効")
+    p.add_argument("--max-phrase-freq", type=int, default=MAX_PHRASE_FREQ,
+                   help="QIバンドパス上限: Method B 辞書 freq がこれを超える phrase(ありふれ過ぎ"
+                        "＝非識別: enjoys/love 等)を許可語彙から除外。0で上限なし")
     p.add_argument("--method-b-csv", type=Path, default=B_CANDIDATES_PATH,
                    help="許可フレーズ語彙に使う Method B 辞書 CSV")
     p.add_argument("--input", type=Path, default=LABELED_CLAUSES_PATH,

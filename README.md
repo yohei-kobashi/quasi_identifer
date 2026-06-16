@@ -11,6 +11,60 @@
 
 ---
 
+## 学習データ仕様：`data/07_reid_samples.parquet`
+
+機械学習担当者へ渡す最終成果物。**1 行 = 1 つのタグ付き clause（テキスト span）**で、
+モデル学習・評価に必要な全て（入力テキスト・目的変数・分割・重み）を含む自己完結ファイル。
+同内容を CSV（`07_reid_samples.csv`）と Parquet（`07_reid_samples.parquet`、`to_parquet.py`
+で生成、列指向＋圧縮で配布・部分読込に有利）の2形式で提供する。
+
+- 規模: **38,690,112 行 × 15 列**（N = 1,000,000 レコード由来）
+- `provenance` 内訳: PROFILE 27,426,378（70.9 %）/ PII 8,917,993（23.1 %）/ NONE 2,345,741（6.1 %）
+- `split` 内訳: train 30,896,561 / test 7,793,551（test は自然分布で固定）
+
+### 列定義
+
+| 列 | 型 | 役割 | 説明 |
+|---|---|---|---|
+| `text` | string | **入力 X** | タグ付き clause の生テキスト。BERT 等の埋め込み入力（埋め込み取得は別コード）|
+| `y_combined` | float | **目的変数 Y（推奨）** | 階層合成: NONE→0 / `support≥2`→`y_risk` / `support=1`→`max(6, y_bits)` / PII→ceiling |
+| `y_risk` | float | 目的変数（別案）| `log10(N/support)`。`support=1` で 6 に飽和 |
+| `y_bits` | float | 目的変数（別案）| `Σ log10(N/df_t)`（識別情報量・非キャップ）。NONE=0 |
+| `y_bits_capped` | float | 同上の `min(6, y_bits)` 版 | 比較用 |
+| `provenance` | category | 層・カテゴリ | `PROFILE`(QIで段階評価) / `PII`(直接識別子=最大リスク, ceiling 固定) / `NONE`(非識別, risk 0) |
+| `split` | category | **分割** | `train` / `test`。QI 構成語でグループ化したリーク防止分割。`test` は母集団の自然分布で固定 |
+| `lds_weight` | float | 標本重み | `y_risk` 基準の LDS（密度逆数）重み。**`y_combined`/`y_bits` 学習時は要再計算**（後述）|
+| `support` | int | メタ/特徴 | その QI 集合 `qi_json` を共有するレコード数（PII は便宜値、リスクは ceiling 固定）|
+| `min_constituent_df` | int | 補助特徴 | 最レア構成語の出現レコード数（最も識別的な単一属性）。NONE=0 |
+| `qi_json` | string | メタ/特徴 | マッチした QI 属性（基底名詞句）の集合（JSON 配列）|
+| `size` | int | メタ/特徴 | QI 集合の要素数 |
+| `tier_strictest` | string | メタ/特徴 | 構成語の最も厳しい alpha tier |
+| `freq` | int | メタ | この clause テキストの出現回数（distinct text 集約前の件数）|
+| `N` | int | 定数 | 総レコード数（1,000,000）|
+
+### 使い方と注意
+
+1. **X = `text` 列**から埋め込みを取得し、**Y = `y_combined`** を回帰（目的変数の設計は後述の節を参照）。`y_risk`（飽和）/`y_bits`（上界）も比較用に同梱。
+2. **`split` を必ず使う。自前でランダム再分割しない**——QI 構成語でグループ化したリーク防止分割であり、ランダム再分割すると同一 QI 集合が train/test に跨ってリークする。`test` は母集団の自然分布で固定された評価集合。
+3. **`lds_weight` は `y_risk` 基準**。`y_combined` で学習する場合は重みを `y_combined` の分布上で再計算する（同梱の `lds_weights()` 参照）。
+4. **PII の扱い**：`provenance == "PII"`（23 %、`y_combined = ceiling`）は、回帰に含めても、二値「確実識別」クラスとして分離してもよい。
+5. **評価**は同梱の `eval_risk.py`（`text, y_true, y_pred[, split]` を入力に、層別 MAE/RMSE・macro 平均・Spearman・unicity-AUC・自明ベースライン）。
+
+### 読込例
+
+```python
+import pandas as pd
+
+# 必要列だけ高速ロード(Parquet の列指向の利点)
+df = pd.read_parquet("data/07_reid_samples.parquet",
+                     columns=["text", "y_combined", "split", "provenance"])
+train = df[df["split"] == "train"]
+test  = df[df["split"] == "test"]      # 自然分布の固定テスト
+# X = embed(train["text"]);  y = train["y_combined"]
+```
+
+---
+
 ## QI 語彙の周波数バンドパス：`MAX_PHRASE_FREQ = 300,000` の選定根拠
 
 ### 背景と問題
